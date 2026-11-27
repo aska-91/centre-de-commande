@@ -1,0 +1,1735 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Centre de commande</title>
+<meta name="description" content="Mes tâches, mes échéances, mes documents et mes objectifs, au même endroit.">
+<meta name="theme-color" content="#1E5E6E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Commande">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<style>
+:root {
+  --color-fg: #18222B; --color-fg-muted: #5A6671; --color-bg: #FFFFFF; --color-panel: #F4F6F8; --color-border-line: #E1E6EB;
+  --color-ok: #2E7D4F; --color-warn: #A35F00; --color-bad: #C0392B;
+  --font-anthropic-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --cds-radius: 12px; color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --color-fg: #E8ECEF; --color-fg-muted: #A2ADB7; --color-bg: #171B1F; --color-panel: #1F252A; --color-border-line: #313A42;
+    --color-ok: #5BC08A; --color-warn: #E3A548; --color-bad: #EF7A70; color-scheme: dark; }
+}
+html, body { margin: 0; min-height: 100%; }
+body { background: color-mix(in srgb, var(--color-fg) 4%, var(--color-bg)); -webkit-text-size-adjust: 100%; }
+.pd { border-radius: 0 !important; min-height: 100vh; max-width: 1400px; margin: 0 auto; }
+.pd-top { border-radius: 0 !important; padding-top: max(14px, env(safe-area-inset-top)) !important; padding-left: max(24px, env(safe-area-inset-left)) !important; padding-right: max(24px, env(safe-area-inset-right)) !important; }
+.pd-body { padding-bottom: max(24px, env(safe-area-inset-bottom)) !important; padding-left: max(24px, env(safe-area-inset-left)) !important; padding-right: max(24px, env(safe-area-inset-right)) !important; }
+@media (max-width: 640px) { .pd-top, .pd-body { padding-left: max(16px, env(safe-area-inset-left)) !important; padding-right: max(16px, env(safe-area-inset-right)) !important; } }
+.pd .pd-savebtn { font-size: 13px; }
+.pd .pd-filebtn { display: inline-flex; align-items: center; font-size: 14px; padding: 8px 12px; border: 1px solid var(--color-border-line); border-radius: 8px; background: var(--color-bg); cursor: pointer; }
+.pd .pd-filebtn input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.pd .pd-filebtn:focus-within { outline: 2px solid var(--acc); outline-offset: 2px; }
+.pd .pd-remind { border-color: color-mix(in srgb, var(--color-warn) 45%, var(--color-border-line)); background: color-mix(in srgb, var(--color-warn) 7%, var(--color-bg)); }
+.pd .pd-import { background: var(--acc-soft); }
+</style>
+<script>
+/* Moteur local du Centre de commande : remplace claude.ai.
+   Les données sont enregistrées dans le navigateur de l'appareil (localStorage). */
+(function () {
+  var KEY = 'centre-de-commande:data:v1';
+  var META = 'centre-de-commande:meta:v1';
+  var COLLS = ['tasks', 'recurring', 'inventory', 'sites', 'goals', 'reviews'];
+  var DATASET = { tasks: 'tasks', recurring: 'recurring', items: 'inventory', sites: 'sites', goals: 'goals', reviews: 'reviews' };
+
+  function empty() { var s = {}; COLLS.forEach(function (c) { s[c] = []; }); return s; }
+  function load() {
+    try {
+      var raw = localStorage.getItem(KEY);
+      if (!raw) return empty();
+      var s = JSON.parse(raw), e = empty();
+      COLLS.forEach(function (c) { e[c] = Array.isArray(s[c]) ? s[c] : []; });
+      return e;
+    } catch (err) { return empty(); }
+  }
+  var store = load();
+  var storageOk = true;
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(store)); storageOk = true; }
+    catch (err) { storageOk = false; throw err; }
+  }
+  function meta(k, v) {
+    try {
+      var m = JSON.parse(localStorage.getItem(META) || '{}');
+      if (arguments.length > 1) { m[k] = v; localStorage.setItem(META, JSON.stringify(m)); }
+      return m[k];
+    } catch (err) { return undefined; }
+  }
+  function newId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+  function clone(x) { return JSON.parse(JSON.stringify(x)); }
+
+  var calcs = {}, draws = {}, onDatas = [], scheduled = false;
+
+  function rowsOf(id) { var c = DATASET[id]; return c ? store[c] : null; }
+  window.dash = {
+    data: function (id) {
+      if (calcs[id]) {
+        var c = calcs[id];
+        try { return { status: 'ok', data: c.fn.apply(null, c.inputs.map(function (i) { return window.dash.data(i).data; })) }; }
+        catch (err) { return { status: 'error', data: null, message: String(err) }; }
+      }
+      var r = rowsOf(id);
+      return r ? { status: 'ok', data: clone(r) } : { status: 'missing', data: [] };
+    },
+    calc: function (id, o) { calcs[id] = o; },
+    loader: function () {},
+    onData: function (fn) { onDatas.push(fn); },
+    setLink: function (name) { try { history.replaceState(null, '', '#' + name); } catch (err) {} },
+    params: function () { return {}; },
+    setParams: function () {},
+    resetParams: function () {},
+    refresh: function () { redrawAll(); },
+    draw: function (name, fn) { if (fn) { draws[name] = fn; return; } run(name); }
+  };
+
+  function visible(el) { return !el.closest('[hidden]'); }
+  function run(name) {
+    var fn = draws[name];
+    if (typeof fn !== 'function') return;
+    document.querySelectorAll('[data-draw="' + name + '"]').forEach(function (el) {
+      if (!visible(el)) return;
+      try { fn(el); } catch (err) { if (window.console) console.error('Dessin « ' + name + ' » :', err); }
+    });
+  }
+  function redrawAll() {
+    scheduled = false;
+    onDatas.forEach(function (f) { try { f(); } catch (err) { console.error(err); } });
+    Object.keys(draws).forEach(run);
+  }
+  function schedule() { if (!scheduled) { scheduled = true; setTimeout(redrawAll, 0); } }
+  window.__cdcRedraw = schedule;
+
+  function parsePath(path) {
+    var p = String(path).split('/'); // data/users/<id>/<coll>/items[/<doc>]
+    var coll = p[3];
+    if (COLLS.indexOf(coll) === -1) throw new Error('Collection inconnue : ' + coll);
+    return { coll: coll, id: p[5] };
+  }
+  var db = {
+    doc: function (path) {
+      var f = parsePath(path);
+      function find() { return store[f.coll].findIndex(function (x) { return x.id === f.id; }); }
+      return {
+        update: async function (d) { var i = find(); if (i === -1) throw new Error('Introuvable'); Object.assign(store[f.coll][i], clone(d)); save(); schedule(); },
+        set: async function (d) { var i = find(), row = Object.assign({ id: f.id }, clone(d)); if (i === -1) store[f.coll].push(row); else store[f.coll][i] = row; save(); schedule(); },
+        delete: async function () { var i = find(); if (i !== -1) store[f.coll].splice(i, 1); save(); schedule(); }
+      };
+    },
+    collection: function (path) {
+      var f = parsePath(path + '/x');
+      return { add: async function (d) { var row = Object.assign({ id: newId() }, clone(d)); store[f.coll].push(row); save(); schedule(); return { id: row.id }; } };
+    }
+  };
+  var user = { id: async function () { return 'local'; } };
+  window.claude = { use: async function (name) { return name === 'db' ? db : name === 'user' ? user : null; } };
+
+  // Autre onglet ouvert sur le même appareil : on se resynchronise.
+  window.addEventListener('storage', function (e) { if (e.key === KEY) { store = load(); schedule(); } });
+
+  // Sauvegarde : export / import
+  window.cdcBackup = {
+    counts: function () { var o = {}; COLLS.forEach(function (c) { o[c] = store[c].length; }); return o; },
+    total: function () { return COLLS.reduce(function (a, c) { return a + store[c].length; }, 0); },
+    exportJson: function () {
+      return JSON.stringify({ app: 'centre-de-commande', format: 1, exportedAt: new Date().toISOString(), data: store }, null, 2);
+    },
+    markExported: function () { meta('lastExport', new Date().toISOString()); },
+    lastExport: function () { return meta('lastExport') || ''; },
+    parse: function (text) {
+      var j = JSON.parse(text);
+      if (!j || j.app !== 'centre-de-commande' || !j.data || typeof j.data !== 'object') throw new Error("Ce fichier n'est pas une sauvegarde du Centre de commande.");
+      var s = empty();
+      COLLS.forEach(function (c) {
+        var arr = j.data[c];
+        if (arr != null && !Array.isArray(arr)) throw new Error('Sauvegarde abîmée (' + c + ').');
+        s[c] = (arr || []).filter(function (r) { return r && typeof r === 'object'; }).map(function (r) { var x = clone(r); if (!x.id) x.id = newId(); return x; });
+      });
+      return { store: s, exportedAt: j.exportedAt || '' };
+    },
+    replace: function (s) { store = s; save(); schedule(); },
+    merge: function (s) {
+      COLLS.forEach(function (c) {
+        var ids = {}; store[c].forEach(function (r) { ids[r.id] = true; });
+        s[c].forEach(function (r) { if (!ids[r.id]) store[c].push(r); });
+      });
+      save(); schedule();
+    },
+    storageOk: function () { return storageOk; }
+  };
+
+  document.addEventListener('DOMContentLoaded', function () {
+    schedule();
+    if (navigator.storage && navigator.storage.persist) { navigator.storage.persist().catch(function () {}); }
+  });
+})();
+
+</script>
+</head>
+<body>
+<style>
+.pd { --acc: color-mix(in srgb, #1E5E6E 78%, var(--color-fg)); --acc-soft: color-mix(in srgb, #1E5E6E 13%, var(--color-bg)); --ground: color-mix(in srgb, var(--color-fg) 4%, var(--color-bg)); --card: var(--color-bg); --line: var(--color-border-line); --muted: var(--color-fg-muted);
+  font-family: var(--font-anthropic-sans); color: var(--color-fg); background: var(--ground); border-radius: var(--cds-radius); display: grid; gap: 0; min-height: 100%; }
+.pd * { box-sizing: border-box; }
+.pd [hidden], .pd[hidden] { display: none !important; }
+.pd h1, .pd h2, .pd h3, .pd p { margin: 0; }
+.pd h1 { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; text-wrap: balance; line-height: 1.2; }
+.pd h2 { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+.pd h3 { font-size: 14px; font-weight: 600; }
+.pd-muted { color: var(--muted); font-size: 13px; }
+.pd-small { font-size: 12px; color: var(--muted); }
+.pd a { color: var(--acc); }
+
+/* En-tête */
+.pd-top { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; padding: 14px 24px; background: var(--card); border-bottom: 1px solid var(--line); border-radius: var(--cds-radius) var(--cds-radius) 0 0; }
+.pd-brand { font-weight: 650; font-size: 16px; letter-spacing: -0.01em; }
+.pd-tabs { display: flex; flex-wrap: wrap; gap: 4px; flex: 1 1 360px; }
+.pd .pd-tabs button { background: transparent; border: 0; color: var(--muted); padding: 8px 12px; border-radius: 8px; font-size: 14px; }
+.pd .pd-tabs button.pd-on { background: var(--acc-soft); color: var(--color-fg); font-weight: 600; }
+.pd-search { display: flex; align-items: center; gap: 8px; flex: 0 1 300px; min-width: 200px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--ground); color: var(--muted); }
+.pd .pd-search input[type=text] { border: 0; background: transparent; font: inherit; font-size: 14px; color: var(--color-fg); flex: 1; min-width: 0; outline: none; padding: 0; }
+.pd-body { padding: 24px; display: grid; gap: 24px; }
+
+/* Contrôles */
+.pd input[type=text], .pd input[type=date], .pd input[type=number], .pd select, .pd textarea { font: inherit; font-size: 14px; color: var(--color-fg); background-color: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+.pd textarea { width: 100%; min-height: 72px; resize: vertical; }
+.pd input[type=number] { width: 80px; }
+.pd button { font: inherit; font-size: 14px; color: var(--color-fg); background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; cursor: pointer; }
+.pd button.pd-primary { background: var(--acc); color: var(--color-bg); border-color: var(--acc); font-weight: 600; }
+.pd button:focus-visible, .pd input:focus-visible, .pd select:focus-visible, .pd textarea:focus-visible, .pd a:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+.pd-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.pd-grow { flex: 1 1 200px; }
+.pd-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.pd-alert { color: var(--color-bad); font-size: 13px; }
+.pd-okmsg { color: var(--color-ok); font-size: 14px; }
+.pd-seg { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 3px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; justify-self: start; }
+.pd .pd-seg button { border: 0; background: transparent; color: var(--muted); padding: 6px 12px; border-radius: 7px; font-size: 13px; }
+.pd .pd-seg button.pd-on { background: var(--acc-soft); color: var(--color-fg); font-weight: 600; }
+
+/* Cartes et listes */
+.pd-card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; display: grid; gap: 12px; align-content: start; min-width: 0; }
+.pd-block { display: grid; gap: 10px; align-content: start; min-width: 0; }
+.pd-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; }
+.pd-list { display: grid; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.pd-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); }
+.pd-row:first-child { border-top: 0; }
+.pd-main { flex: 1 1 200px; min-width: 0; display: grid; gap: 2px; overflow-wrap: anywhere; }
+.pd .pd-t { background: none; border: 0; padding: 0; text-align: left; cursor: pointer; font: inherit; font-size: 14px; color: var(--color-fg); }
+.pd .pd-t:hover { text-decoration: underline; }
+.pd-row.pd-done .pd-t { color: var(--muted); text-decoration: line-through; }
+.pd-note { color: var(--muted); font-size: 12px; white-space: pre-line; }
+.pd-pill { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; border-radius: 999px; padding: 2px 9px; background: var(--ground); color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pd-pill.pd-late { color: var(--color-bad); background: color-mix(in srgb, var(--color-bad) 12%, var(--color-bg)); }
+.pd-pill.pd-soon { color: var(--color-warn); background: color-mix(in srgb, var(--color-warn) 13%, var(--color-bg)); }
+.pd-pill.pd-ok { color: var(--color-ok); background: color-mix(in srgb, var(--color-ok) 12%, var(--color-bg)); }
+.pd-pill.pd-acc { color: var(--acc); background: var(--acc-soft); }
+.pd-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; }
+.pd .pd-icon { padding: 3px 9px; color: var(--muted); background: transparent; }
+.pd .pd-star[aria-pressed="true"] { color: var(--color-warn); border-color: var(--color-warn); }
+.pd-group { padding: 8px 14px; background: var(--ground); border-top: 1px solid var(--line); font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.pd-group:first-child { border-top: 0; }
+.pd-empty { padding: 14px; color: var(--muted); font-size: 14px; }
+.pd-row select { padding: 3px 6px; font-size: 12px; }
+.pd-bar { height: 6px; border-radius: 999px; background: var(--ground); overflow: hidden; }
+.pd-bar > span { display: block; height: 100%; background: var(--acc); border-radius: 999px; }
+
+/* Accueil */
+.pd-home { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 380px); gap: 24px; align-items: start; }
+@media (max-width: 900px) { .pd-home { grid-template-columns: minmax(0, 1fr); } }
+.pd-hello { display: grid; gap: 4px; }
+.pd-capture { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; display: grid; gap: 10px; }
+.pd-capture-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.pd-capture-in { flex: 1 1 260px; display: flex; align-items: center; gap: 10px; padding: 4px 12px; border-radius: 10px; background: var(--ground); }
+.pd .pd-capture-in input[type=text] { border: 0; background: transparent; font-size: 15px; padding: 8px 0; flex: 1; outline: none; }
+.pd-preview { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
+.pd-preview label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.pd-preview select, .pd-preview input { padding: 4px 8px !important; font-size: 13px !important; }
+.pd-slots { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 640px) { .pd-slots { grid-template-columns: minmax(0, 1fr); } }
+.pd-slot { min-height: 92px; padding: 14px; border-radius: 12px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+.pd-slot.pd-full { background: var(--card); border: 1px solid var(--line); }
+.pd-slot.pd-free { border: 1.5px dashed color-mix(in srgb, var(--muted) 55%, var(--color-bg)); color: var(--muted); font-size: 14px; }
+.pd-slot-n { font-size: 20px; font-weight: 600; color: color-mix(in srgb, var(--muted) 70%, var(--color-bg)); }
+.pd-week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; }
+@media (max-width: 760px) { .pd-week { grid-template-columns: minmax(0, 1fr); } }
+.pd-day { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px; display: grid; gap: 6px; align-content: start; min-height: 130px; min-width: 0; }
+@media (max-width: 760px) { .pd-day { min-height: 0; } }
+.pd-day.pd-today { border: 1.5px solid var(--acc); }
+.pd-day-h { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+.pd-day-h b { color: var(--color-fg); font-weight: 600; }
+.pd .pd-chipitem { text-align: left; font-size: 12px; line-height: 1.3; padding: 6px 7px; border-radius: 6px; border: 0; width: 100%; color: var(--color-fg); }
+.pd-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: break-word; hyphens: auto; }
+.pd-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.pd .pd-tile { display: grid; gap: 4px; text-align: left; padding: 11px 12px; border-radius: 12px; background: var(--card); border: 1px solid var(--line); min-width: 0; }
+.pd .pd-tile:hover { border-color: var(--acc); }
+.pd-tile-name { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13px; }
+.pd-late-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 12px; background: color-mix(in srgb, var(--color-bad) 10%, var(--color-bg)); color: var(--color-fg); font-size: 14px; }
+
+/* Ma vie */
+.pd-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.pd .pd-chips button { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; font-size: 13px; border-radius: 999px; }
+.pd .pd-chips button.pd-on { background: var(--color-fg); color: var(--color-bg); border-color: var(--color-fg); }
+.pd-vie { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 340px); gap: 20px; align-items: start; }
+@media (max-width: 900px) { .pd-vie { grid-template-columns: minmax(0, 1fr); } }
+.pd-dossier { display: grid; gap: 14px; }
+
+/* Objectifs et revue */
+.pd-goals { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.pd-goal-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.pd .pd-goal-head .pd-t { font-size: 16px; font-weight: 600; flex: 1 1 200px; }
+.pd-steps { display: grid; gap: 22px; }
+.pd-step { display: grid; gap: 8px; }
+.pd-step h2 { display: flex; gap: 10px; align-items: baseline; }
+.pd-num { font-size: 18px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* Panneaux de modification */
+.pd-edit { background: var(--card); border: 1.5px solid var(--acc); border-radius: 14px; padding: 18px; display: grid; gap: 10px; }
+.pd-edit label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+.pd-edit .pd-form label { flex: 1 1 150px; }
+.pd-edit label.pd-check { display: inline-flex; color: var(--color-fg); font-size: 14px; }
+.pd-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.pd-actions .pd-spacer { flex: 1; }
+.pd details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.pd-sugg { display: grid; gap: 10px; padding-top: 8px; }
+.pd-sugg-dom { display: grid; gap: 5px; }
+.pd-sugg-dom > span { font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.pd .pd-sugg button { border-style: dashed; padding: 4px 10px; font-size: 12px; border-radius: 999px; }
+@media (max-width: 640px) { .pd-body { padding: 16px; } .pd-top { padding: 12px 16px; } .pd-search { flex: 1 1 100%; } }
+</style>
+
+<div class="pd" lang="fr">
+  <header class="pd-top">
+    <div class="pd-brand" id="titre">Centre de commande</div>
+    <nav class="pd-tabs" id="onglets" aria-label="Sections">
+      <button type="button" data-tab="aujourdhui" class="pd-on" aria-pressed="true">Aujourd'hui</button>
+      <button type="button" data-tab="ma-vie" aria-pressed="false">Ma vie</button>
+      <button type="button" data-tab="objectifs" aria-pressed="false">Objectifs et revue</button>
+      <button type="button" data-tab="coffre" aria-pressed="false">Coffre</button>
+    </nav>
+    <label class="pd-search" for="q">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+      <input type="text" id="q" placeholder="Rechercher partout : passeport, Netflix…" aria-label="Rechercher partout">
+    </label>
+    <button type="button" id="b-open" class="pd-savebtn">Sauvegarde</button>
+  </header>
+
+  <div class="pd-body">
+    <div class="pd-card pd-remind" id="rappel-sauvegarde" hidden>
+      <div class="pd-head"><b id="rappel-texte">Pensez à sauvegarder vos données.</b><button type="button" class="pd-primary" id="rappel-btn">Sauvegarder maintenant</button></div>
+      <p class="pd-small">Vos données ne sont enregistrées que sur cet appareil. Une sauvegarde régulière vous protège si le navigateur est réinitialisé ou si vous changez d'appareil.</p>
+    </div>
+
+    <section class="pd-card" id="sauvegarde" hidden>
+      <div class="pd-head"><h2>Sauvegarde et transfert</h2><button type="button" id="b-close">Fermer</button></div>
+      <p class="pd-muted">Tout est enregistré automatiquement sur cet appareil, sans serveur ni compte. Pour ne rien perdre, ou pour retrouver vos données sur un autre appareil, exportez une sauvegarde puis importez-la de l'autre côté.</p>
+      <p class="pd-small" id="b-state">—</p>
+      <div class="pd-form">
+        <button type="button" class="pd-primary" id="b-export">Télécharger une sauvegarde</button>
+        <button type="button" id="b-share" hidden>Envoyer vers Fichiers, OneDrive…</button>
+        <label class="pd-filebtn" for="b-file">Importer une sauvegarde<input type="file" id="b-file" accept=".json,application/json"></label>
+      </div>
+      <div class="pd-card pd-import" id="b-import" hidden>
+        <b id="b-import-title">—</b>
+        <p class="pd-small" id="b-import-detail">—</p>
+        <div class="pd-actions">
+          <button type="button" class="pd-primary" id="b-replace">Remplacer mes données par ce fichier</button>
+          <button type="button" id="b-merge">Ajouter ce qui manque</button>
+          <button type="button" id="b-cancel">Annuler</button>
+        </div>
+        <p class="pd-small">« Remplacer » efface les données de cet appareil. Téléchargez d'abord une sauvegarde si vous avez un doute.</p>
+      </div>
+      <p class="pd-alert" id="b-error" hidden>—</p>
+      <p class="pd-okmsg" id="b-ok" hidden>—</p>
+      <p class="pd-alert" id="b-storage" hidden>Ce navigateur refuse d'enregistrer les données (navigation privée ou stockage plein). Vos modifications seront perdues en fermant la page.</p>
+    </section>
+    <p class="pd-alert pd-unsaved-msg" hidden>Cette modification n'a pas été enregistrée. Réessayez dans un instant.</p>
+    <p class="pd-alert pd-prio-msg" hidden>Vous avez déjà 3 priorités. Retirez l'étoile d'une tâche avant d'en ajouter une autre.</p>
+
+    <section class="pd-card" id="resultats" hidden>
+      <div class="pd-head"><h2>Résultats de la recherche</h2><button type="button" id="q-clear">Effacer la recherche</button></div>
+      <div class="pd-list" data-draw="search" data-source="tasks recurring items sites goals"></div>
+    </section>
+
+    <form class="pd-edit" id="edition" hidden>
+      <h2>Modifier la tâche</h2>
+      <label for="e-title">Titre<input type="text" id="e-title"></label>
+      <div class="pd-form">
+        <label for="e-domain">Domaine<select id="e-domain"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select></label>
+        <label for="e-due">Échéance<input type="date" id="e-due"></label>
+        <label for="e-goal">Objectif lié<select id="e-goal" data-draw="goal-opts" data-source="goals"></select></label>
+      </div>
+      <label for="e-note">Note : où se trouve le document, qui contacter, prochaine étape<textarea id="e-note"></textarea></label>
+      <label class="pd-check" for="e-prio"><input type="checkbox" id="e-prio"> Priorité de la semaine</label>
+      <div class="pd-actions"><button type="submit" class="pd-primary">Enregistrer</button><button type="button" id="e-cancel">Annuler</button><span class="pd-spacer"></span><button type="button" id="e-delete">Supprimer la tâche</button></div>
+    </form>
+
+    <form class="pd-edit" id="r-edition" hidden>
+      <h2>Modifier l'échéance récurrente</h2>
+      <label for="re-title">Titre<input type="text" id="re-title"></label>
+      <div class="pd-form">
+        <label for="re-domain">Domaine<select id="re-domain"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select></label>
+        <label for="re-next">Prochaine fois<input type="date" id="re-next"></label>
+        <label for="re-every">Tous les<input type="number" id="re-every" min="1" value="1"></label>
+        <label for="re-unit">Unité<select id="re-unit"><option value="day">jour(s)</option><option value="week">semaine(s)</option><option value="month">mois</option><option value="year">an(s)</option></select></label>
+      </div>
+      <div class="pd-actions"><button type="submit" class="pd-primary">Enregistrer</button><button type="button" id="re-cancel">Annuler</button><span class="pd-spacer"></span><button type="button" id="re-delete">Supprimer l'échéance</button></div>
+    </form>
+
+    <form class="pd-edit" id="i-edition" hidden>
+      <h2>Modifier l'élément du coffre</h2>
+      <label for="ie-name">Document ou objet<input type="text" id="ie-name"></label>
+      <div class="pd-form">
+        <label for="ie-domain">Domaine<select id="ie-domain"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select></label>
+        <label for="ie-kind">Forme<select id="ie-kind"><option>Papier</option><option>Numérique</option><option>Papier et numérique</option><option>Objet</option></select></label>
+        <label for="ie-exp">Valable jusqu'au<input type="date" id="ie-exp"></label>
+      </div>
+      <label for="ie-place">Où il se trouve<input type="text" id="ie-place"></label>
+      <label for="ie-note">Comment y accéder, remarques<textarea id="ie-note"></textarea></label>
+      <div class="pd-actions"><button type="submit" class="pd-primary">Enregistrer</button><button type="button" id="ie-cancel">Annuler</button><span class="pd-spacer"></span><button type="button" id="ie-delete">Supprimer l'élément</button></div>
+    </form>
+
+    <form class="pd-edit" id="s-edition" hidden>
+      <h2>Modifier le compte</h2>
+      <div class="pd-form">
+        <label for="se-name">Nom du site<input type="text" id="se-name"></label>
+        <label for="se-url">Adresse<input type="text" id="se-url"></label>
+      </div>
+      <div class="pd-form">
+        <label for="se-domain">Domaine<select id="se-domain"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select></label>
+        <label for="se-mail">E-mail utilisé<input type="text" id="se-mail"></label>
+        <label for="se-status">Statut<select id="se-status"><option>Actif</option><option>À fermer</option><option>Fermé</option></select></label>
+        <label for="se-cost">Coût par mois (€)<input type="number" id="se-cost" min="0" step="0.01"></label>
+      </div>
+      <label for="se-note">Remarques (jamais de mot de passe)<textarea id="se-note"></textarea></label>
+      <div class="pd-actions"><button type="submit" class="pd-primary">Enregistrer</button><button type="button" id="se-cancel">Annuler</button><span class="pd-spacer"></span><button type="button" id="se-delete">Supprimer le compte</button></div>
+    </form>
+
+    <form class="pd-edit" id="g-edition" hidden>
+      <h2>Modifier l'objectif</h2>
+      <label for="ge-title">Objectif<input type="text" id="ge-title"></label>
+      <div class="pd-form">
+        <label for="ge-domain">Domaine<select id="ge-domain"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select></label>
+        <label for="ge-horizon">Horizon<select id="ge-horizon"><option>Cette année</option><option>D'ici 3 ans</option><option>Plus tard</option></select></label>
+        <label for="ge-status">Statut<select id="ge-status"><option>En cours</option><option>En pause</option><option>Atteint</option></select></label>
+      </div>
+      <label for="ge-why">Pourquoi c'est important pour moi<textarea id="ge-why"></textarea></label>
+      <div class="pd-actions"><button type="submit" class="pd-primary">Enregistrer</button><button type="button" id="ge-cancel">Annuler</button><span class="pd-spacer"></span><button type="button" id="ge-delete">Supprimer l'objectif</button></div>
+    </form>
+
+    <!-- AUJOURD'HUI -->
+    <section id="aujourdhui" class="pd-home">
+      <div class="pd-block" style="gap: 22px">
+        <div class="pd-hello">
+          <span class="pd-muted" data-draw="today-label">—</span>
+          <h1><span data-draw="h-week" data-source="stats" data-field="week" data-row="0">—</span> d'ici 7 jours, <span data-draw="h-late" data-source="stats" data-field="late" data-row="0">—</span></h1>
+        </div>
+
+        <form class="pd-capture" id="capture">
+          <div class="pd-capture-row">
+            <label class="pd-capture-in" for="c-text">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
+              <input type="text" id="c-text" placeholder="Écrivez comme vous parlez : « dentiste vendredi », « loyer chaque mois le 5 », « où est mon bail ? »">
+            </label>
+            <button type="submit" class="pd-primary" id="c-add">Ajouter</button>
+          </div>
+          <div class="pd-preview" id="c-preview" hidden>
+            <span class="pd-small">Compris comme :</span>
+            <label for="c-kind">Type<select id="c-kind"><option value="task">Tâche</option><option value="rec">Échéance récurrente</option><option value="search">Recherche</option></select></label>
+            <label for="c-domain">Domaine<select id="c-domain"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select></label>
+            <label for="c-date">Date<input type="date" id="c-date"></label>
+            <label for="c-every" class="pd-c-rec">Tous les<input type="number" id="c-every" min="1" value="1"></label>
+            <label for="c-unit" class="pd-c-rec">Unité<select id="c-unit"><option value="day">jour(s)</option><option value="week">semaine(s)</option><option value="month">mois</option><option value="year">an(s)</option></select></label>
+            <label class="pd-check" for="c-prio"><input type="checkbox" id="c-prio"> Priorité</label>
+          </div>
+          <p class="pd-small" id="c-title-line" hidden>Sera enregistré sous le titre : <b id="c-title-out" data-draw="c-title">—</b></p>
+          <p class="pd-alert pd-cdate-msg" hidden>Pour une échéance récurrente, indiquez la date de la prochaine fois.</p>
+          <p class="pd-okmsg pd-cok-msg" hidden>Ajouté.</p>
+        </form>
+
+        <div class="pd-late-strip" id="retards" hidden>
+          <b>En retard :</b>
+          <span data-draw="late-strip" data-source="tasks"></span>
+        </div>
+
+        <div class="pd-block" id="priorites">
+          <div class="pd-head"><h2>Mes 3 priorités</h2><span class="pd-small">Cliquez sur l'étoile ☆ d'une tâche pour la placer ici</span></div>
+          <div class="pd-slots" data-draw="slots" data-source="tasks"></div>
+        </div>
+
+        <div class="pd-block" id="semaine">
+          <div class="pd-head"><h2>Mes 7 prochains jours</h2><span class="pd-small">Tâches et échéances récurrentes, jour par jour</span></div>
+          <div class="pd-week" data-draw="week" data-source="tasks recurring"></div>
+        </div>
+
+        <div class="pd-block" id="a-renouveler" hidden>
+          <h2>Documents à renouveler dans les 90 jours</h2>
+          <div class="pd-list" data-draw="home-exp" data-source="items"></div>
+        </div>
+      </div>
+
+      <aside class="pd-block" style="gap: 18px">
+        <div class="pd-block">
+          <div class="pd-head"><h2>Ma vie</h2><button type="button" class="pd-icon" data-goto="ma-vie">Tout voir</button></div>
+          <div class="pd-tiles" data-draw="tiles" data-source="tasks recurring items sites goals"></div>
+        </div>
+        <div class="pd-card">
+          <div class="pd-head"><h3>Objectifs</h3><button type="button" class="pd-icon" data-goto="objectifs">Ouvrir</button></div>
+          <div class="pd-block" data-draw="home-goals" data-source="goals tasks"></div>
+        </div>
+        <div class="pd-card">
+          <div class="pd-head"><h3>Coffre</h3><span class="pd-small"><b data-draw="inv-done" data-source="inv" data-field="done" data-row="0">—</b> sur <b data-draw="inv-total" data-source="inv" data-field="total" data-row="0">—</b> essentiels notés</span></div>
+          <div class="pd-bar" data-draw="inv-bar" data-source="inv"></div>
+          <p class="pd-small" data-draw="inv-next" data-source="items">—</p>
+          <div class="pd-form"><span class="pd-small">Abonnements : <b data-draw="c-cout2" data-source="subs" data-field="mensuel" data-row="0">—</b> par mois</span></div>
+        </div>
+        <button type="button" class="pd-primary" id="go-revue">Faire ma revue de la semaine</button>
+      </aside>
+    </section>
+
+    <!-- MA VIE -->
+    <section id="ma-vie" class="pd-block" style="gap: 18px" hidden>
+      <div class="pd-chips" data-draw="vie-chips" data-source="tasks"></div>
+      <div class="pd-vie">
+        <div class="pd-block">
+          <form class="pd-form" id="t-form">
+            <input type="text" id="t-title" class="pd-grow" aria-label="Nouvelle tâche" placeholder="Nouvelle tâche">
+            <select id="t-domain" aria-label="Domaine"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select>
+            <input type="date" id="t-due" aria-label="Échéance">
+            <label class="pd-check" for="t-prio"><input type="checkbox" id="t-prio"> Priorité</label>
+            <button type="submit" class="pd-primary">Ajouter</button>
+          </form>
+          <div class="pd-form"><label class="pd-check" for="t-showdone"><input type="checkbox" id="t-showdone"> Afficher les tâches terminées</label><span class="pd-small">Cliquez sur une tâche pour la modifier ou y ajouter une note.</span></div>
+          <div class="pd-list" data-draw="tasklist" data-source="tasks"></div>
+        </div>
+        <aside class="pd-dossier">
+          <div class="pd-card">
+            <h3>Échéances récurrentes</h3>
+            <div class="pd-block" data-draw="vie-rec" data-source="recurring"></div>
+          </div>
+          <div class="pd-card">
+            <h3>Documents et objets</h3>
+            <div class="pd-block" data-draw="vie-items" data-source="items"></div>
+          </div>
+          <div class="pd-card">
+            <h3>Comptes en ligne</h3>
+            <div class="pd-block" data-draw="vie-sites" data-source="sites"></div>
+          </div>
+          <div class="pd-card">
+            <h3>Objectifs</h3>
+            <div class="pd-block" data-draw="vie-goals" data-source="goals tasks"></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- OBJECTIFS ET REVUE -->
+    <section id="objectifs" class="pd-block" style="gap: 18px" hidden>
+      <div class="pd-seg" id="obj-seg">
+        <button type="button" data-sub="obj-liste" class="pd-on">Objectifs</button>
+        <button type="button" data-sub="obj-revue">Revue de la semaine</button>
+      </div>
+
+      <div id="obj-liste" class="pd-block" style="gap: 14px">
+        <p class="pd-muted">Deux ou trois objectifs suffisent. Notez pourquoi chacun compte, puis découpez-le en étapes : chaque étape devient une tâche, et l'avancement se calcule tout seul.</p>
+        <form class="pd-form" id="g-form">
+          <input type="text" id="g-title" class="pd-grow" aria-label="Nouvel objectif" placeholder="Par exemple : décider de mon évolution professionnelle">
+          <select id="g-domain" aria-label="Domaine"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select>
+          <select id="g-horizon" aria-label="Horizon"><option>Cette année</option><option>D'ici 3 ans</option><option>Plus tard</option></select>
+          <button type="submit" class="pd-primary">Ajouter</button>
+        </form>
+        <label class="pd-check" for="g-showall"><input type="checkbox" id="g-showall"> Afficher les objectifs atteints et en pause</label>
+        <div class="pd-goals" data-draw="goallist" data-source="goals tasks"></div>
+      </div>
+
+      <div id="obj-revue" class="pd-block" style="gap: 14px" hidden>
+        <p class="pd-muted">30 minutes, une fois par semaine. Suivez les cinq étapes dans l'ordre, puis enregistrez la revue.</p>
+        <p class="pd-okmsg pd-review-ok" hidden>Revue enregistrée. La prochaine est programmée dans vos échéances récurrentes.</p>
+        <div class="pd-steps">
+          <div class="pd-step" id="revue-1">
+            <h2><span class="pd-num">1</span> Ce que j'ai accompli cette semaine</h2>
+            <p class="pd-small">Les tâches cochées ces 7 derniers jours. Ajoutez ce qui n'était pas dans le tableau.</p>
+            <div class="pd-list" data-draw="rv-done" data-source="tasks"></div>
+            <textarea id="rv-wins" aria-label="Autres réussites de la semaine" placeholder="Autres réussites, même petites"></textarea>
+          </div>
+          <div class="pd-step" id="revue-2">
+            <h2><span class="pd-num">2</span> Ce qui est en retard</h2>
+            <p class="pd-small">Pour chaque tâche : la faire, la reporter d'une semaine ou la supprimer si elle n'a plus de sens.</p>
+            <div class="pd-list" data-draw="rv-late" data-source="tasks"></div>
+          </div>
+          <div class="pd-step" id="revue-3">
+            <h2><span class="pd-num">3</span> Mes 3 priorités pour la semaine qui vient</h2>
+            <p class="pd-small">Étoilez les trois tâches les plus importantes. Retirez l'étoile de celles qui ne le sont plus.</p>
+            <div class="pd-list" data-draw="rv-prio" data-source="tasks"></div>
+          </div>
+          <div class="pd-step" id="revue-4">
+            <h2><span class="pd-num">4</span> Mes objectifs avancent-ils ?</h2>
+            <p class="pd-small">Un objectif sans prochaine étape n'avance pas. Ajoutez-en une à chacun dans l'onglet Objectifs.</p>
+            <div class="pd-list" data-draw="rv-goals" data-source="goals tasks"></div>
+          </div>
+          <div class="pd-step" id="revue-5">
+            <h2><span class="pd-num">5</span> Une note pour moi</h2>
+            <textarea id="rv-note" aria-label="Note de la semaine" placeholder="Ce qui m'a pesé, ce qui m'a fait du bien, ce que je veux changer"></textarea>
+          </div>
+          <button type="button" class="pd-primary" id="rv-save" style="justify-self: start">Enregistrer la revue</button>
+          <details class="pd-block" id="revues-passees">
+            <summary>Mes revues précédentes</summary>
+            <div class="pd-list" data-draw="rv-history" data-source="reviews"></div>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <!-- COFFRE -->
+    <section id="coffre" class="pd-block" style="gap: 18px" hidden>
+      <div class="pd-seg" id="coffre-seg">
+        <button type="button" data-sub="cof-inv" class="pd-on">Où est quoi</button>
+        <button type="button" data-sub="cof-comptes">Comptes et abonnements</button>
+        <button type="button" data-sub="cof-rec">Échéances récurrentes</button>
+      </div>
+
+      <div id="cof-inv" class="pd-block" style="gap: 14px">
+        <p class="pd-muted">Essentiels notés : <b data-draw="inv-done2" data-source="inv" data-field="done" data-row="0">—</b> sur <b data-draw="inv-total2" data-source="inv" data-field="total" data-row="0">—</b> · Éléments dans le coffre : <b data-draw="inv-count" data-source="inv" data-field="count" data-row="0">—</b>. Notez où se trouve chaque document et comment y accéder, jamais un numéro, un code ou un mot de passe.</p>
+        <form class="pd-form" id="i-form">
+          <input type="text" id="i-name" class="pd-grow" aria-label="Document ou objet" placeholder="Document ou objet, par exemple : passeport">
+          <select id="i-domain" aria-label="Domaine"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select>
+          <select id="i-kind" aria-label="Forme"><option>Papier</option><option>Numérique</option><option>Papier et numérique</option><option>Objet</option></select>
+          <input type="text" id="i-place" class="pd-grow" aria-label="Où il se trouve" placeholder="Où il se trouve : classeur bleu, OneDrive › Impôts…">
+          <label class="pd-check" for="i-exp">Valable jusqu'au <input type="date" id="i-exp"></label>
+          <button type="submit" class="pd-primary">Ajouter</button>
+        </form>
+        <details class="pd-block" id="essentiels" open>
+          <summary>Liste des essentiels à inventorier. Un clic préremplit le formulaire.</summary>
+          <div class="pd-sugg" data-draw="inv-sugg" data-source="items"></div>
+        </details>
+        <div class="pd-form">
+          <div class="pd-seg" id="i-kinds">
+            <button type="button" data-k="all" class="pd-on">Tous</button>
+            <button type="button" data-k="Papier">Papier</button>
+            <button type="button" data-k="Numérique">Numérique</button>
+            <button type="button" data-k="Papier et numérique">Les deux</button>
+            <button type="button" data-k="Objet">Objet</button>
+          </div>
+        </div>
+        <div class="pd-list" data-draw="inv-list" data-source="items"></div>
+      </div>
+
+      <div id="cof-comptes" class="pd-block" style="gap: 14px" hidden>
+        <p class="pd-muted">Comptes actifs : <b data-draw="c-actifs" data-source="subs" data-field="actifs" data-row="0">—</b> · À fermer : <b data-draw="c-fermer" data-source="subs" data-field="afermer" data-row="0">—</b> · Abonnements : <b data-draw="c-cout" data-source="subs" data-field="mensuel" data-row="0">—</b> par mois. Pour retrouver vos inscriptions, cherchez « bienvenue » ou « confirmation de votre compte » dans votre boîte mail.</p>
+        <form class="pd-form" id="s-form">
+          <input type="text" id="s-name" class="pd-grow" aria-label="Nom du site" placeholder="Nom du site">
+          <input type="text" id="s-url" class="pd-grow" aria-label="Adresse du site" placeholder="Adresse (impots.gouv.fr)">
+          <select id="s-domain" aria-label="Domaine"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select>
+          <input type="text" id="s-mail" class="pd-grow" aria-label="E-mail utilisé" placeholder="E-mail utilisé pour l'inscription">
+          <select id="s-status" aria-label="Statut"><option>Actif</option><option>À fermer</option><option>Fermé</option></select>
+          <input type="number" id="s-cost" min="0" step="0.01" aria-label="Coût par mois en euros" placeholder="€/mois">
+          <button type="submit" class="pd-primary">Ajouter</button>
+        </form>
+        <div class="pd-list" data-draw="sitelist" data-source="sites"></div>
+      </div>
+
+      <div id="cof-rec" class="pd-block" style="gap: 14px" hidden>
+        <p class="pd-muted">Ce qui revient régulièrement : revue, budget, impôts, assurances, passeport, contrôle technique, visites médicales. « Fait » programme automatiquement la prochaine fois. Vous pouvez aussi les ajouter depuis l'accueil en écrivant « assurance habitation chaque année le 1er mars ».</p>
+        <form class="pd-form" id="r-form">
+          <input type="text" id="r-title" class="pd-grow" aria-label="Échéance récurrente" placeholder="Par exemple : renouveler l'assurance habitation">
+          <select id="r-domain" aria-label="Domaine"><option>Général</option><option>Administratif</option><option>Santé</option><option>Finances</option><option>Logement</option><option>Famille</option><option>Travail</option><option>Carrière</option><option>Numérique et souvenirs</option><option>Bien-être</option></select>
+          <input type="date" id="r-next" aria-label="Prochaine fois">
+          <span class="pd-check">tous les</span>
+          <input type="number" id="r-every" min="1" value="1" aria-label="Intervalle">
+          <select id="r-unit" aria-label="Unité"><option value="week">semaine(s)</option><option value="month">mois</option><option value="year">an(s)</option><option value="day">jour(s)</option></select>
+          <button type="submit" class="pd-primary">Ajouter</button>
+        </form>
+        <p class="pd-alert pd-rdate-msg" hidden>Indiquez la date de la prochaine fois.</p>
+        <div class="pd-list" data-draw="reclist" data-source="recurring"></div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>
+(function () {
+  // Interprète une phrase en français : type, titre, domaine, date, fréquence, priorité.
+  var MONTHS = ['janvier', 'fevrier', 'mars', 'avril', 'mai', 'juin', 'juillet', 'aout', 'septembre', 'octobre', 'novembre', 'decembre'];
+  var WEEKDAYS = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+  var DOMAIN_WORDS = [
+    ['Santé', ['medecin', 'docteur', 'dentiste', 'ordonnance', 'analyse', 'prise de sang', 'mutuelle', 'vaccin', 'pharmacie', 'kine', 'ophtalmo', 'radio', 'irm', 'hopital', 'sante', 'carte vitale', 'generaliste', 'specialiste', 'dermato', 'lunettes']],
+    ['Carrière', ['cv', 'candidature', 'postuler', 'entretien d\'embauche', 'entretien', 'formation', 'linkedin', 'offre d\'emploi', 'recruteur', 'salaire', 'carriere', 'certification', 'reconversion']],
+    ['Administratif', ['passeport', 'carte d\'identite', 'identite', 'impot', 'impots', 'carte grise', 'permis', 'papiers', 'mairie', 'prefecture', 'caf', 'attestation', 'declaration', 'administratif', 'acte de naissance', 'controle technique', 'urssaf', 'ameli', 'retraite']],
+    ['Logement', ['assurance habitation', 'loyer', 'appartement', 'maison', 'travaux', 'plombier', 'electricien', 'edf', 'chaudiere', 'proprietaire', 'bail', 'demenagement', 'syndic', 'jardin', 'cuisine', 'salle de bain', 'logement']],
+    ['Finances', ['banque', 'budget', 'epargne', 'virement', 'facture', 'credit', 'pret', 'assurance', 'depenses', 'abonnement', 'rembourser', 'remboursement', 'compte bancaire', 'livret', 'placement', 'finances']],
+    ['Famille', ['ma femme', 'femme', 'enfant', 'enfants', 'fils', 'fille', 'parents', 'mere', 'pere', 'maman', 'papa', 'anniversaire', 'famille', 'frere', 'soeur', 'mariage', 'beau-pere', 'belle-mere']],
+    ['Travail', ['reunion', 'collegue', 'manager', 'chef', 'client', 'bureau', 'pc pro', 'ordinateur pro', 'ordinateur professionnel', 'rapport', 'travail', 'boulot', 'equipe', 'projet pro']],
+    ['Numérique et souvenirs', ['mail', 'mails', 'email', 'e-mail', 'outlook', 'gmail', 'boite mail', 'photo', 'photos', 'video', 'videos', 'fichier', 'fichiers', 'sauvegarde', 'sauvegarder', 'mot de passe', 'mots de passe', 'ordinateur', 'telephone', 'souvenirs', 'cloud', 'onedrive', 'disque dur', 'desabonner']],
+    ['Bien-être', ['sport', 'salle de sport', 'courir', 'course a pied', 'yoga', 'meditation', 'sommeil', 'lecture', 'lire', 'vacances', 'marche', 'velo', 'natation', 'piscine', 'detente', 'loisir']]
+  ];
+
+  function plainChar(c) { var s = c.normalize('NFD').replace(/[̀-ͯ]/g, ''); return (s.charAt(0) || c).toLowerCase(); }
+  function plain(s) { var out = ''; for (var i = 0; i < s.length; i++) out += plainChar(s.charAt(i)); return out.replace(/[’`]/g, '\''); }
+  function isoOf(y, m, d) { var dt = new Date(Date.UTC(y, m, d)); return dt.toISOString().slice(0, 10); }
+  function lastDay(y, m) { return new Date(Date.UTC(y, m + 1, 0)).getUTCDate(); }
+
+  function parseCapture(text, todayIso) {
+    var src = String(text || '');
+    var n = plain(src);
+    var spans = [];
+    var t = todayIso.split('-').map(Number);
+    var Y = t[0], M = t[1] - 1, D = t[2];
+    var todayUtc = Date.UTC(Y, M, D);
+    var res = { kind: 'task', title: '', domain: '', date: '', every: 0, unit: '', prio: false };
+    function add(m) { spans.push([m.index, m.index + m[0].length]); }
+    function plus(days) { return new Date(todayUtc + days * 86400000).toISOString().slice(0, 10); }
+    function future(y, m, d, hasYear) {
+      d = Math.min(d, lastDay(y, m));
+      var iso = isoOf(y, m, d);
+      if (!hasYear && iso < todayIso) { y += 1; d = Math.min(d, lastDay(y, m)); iso = isoOf(y, m, d); }
+      return iso;
+    }
+    var m;
+
+    // Recherche : « où est… »
+    m = /^\s*(ou (est|sont|se trouve|se trouvent)|ou ai-je (mis|range)|cherche[rz]?|trouver)\b\s*/.exec(n);
+    if (m) {
+      res.kind = 'search';
+      res.title = src.slice(m[0].length).replace(/^(mon|ma|mes|le|la|les|l')\s*/i, '').replace(/[?\s]+$/, '').trim();
+      return res;
+    }
+
+    // Fréquence
+    var wdRec = /\b(?:tous les|chaque) (lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)s?\b/.exec(n);
+    if (wdRec) {
+      res.every = 1; res.unit = 'semaine'; add(wdRec);
+      var tg = WEEKDAYS.indexOf(wdRec[1]), cw = new Date(todayUtc).getUTCDay();
+      var df = (tg - cw + 7) % 7; if (df === 0) df = 7;
+      res.date = plus(df);
+    }
+    else if ((m = /\b(?:tous|toutes) les (\d+) (jours?|semaines?|mois|ans?|annees?)\b/.exec(n))) { res.every = Number(m[1]); res.unit = m[2]; add(m); }
+    else if ((m = /\b(?:tous|toutes) les (jours|semaines|mois|ans|annees)\b/.exec(n))) { res.every = 1; res.unit = m[1]; add(m); }
+    else if ((m = /\bchaque (jour|semaine|mois|annee|an)\b/.exec(n))) { res.every = 1; res.unit = m[1]; add(m); }
+    else if ((m = /\b(quotidien(?:ne)?|hebdomadaire|mensuel(?:le)?|annuel(?:le)?|trimestriel(?:le)?)\b/.exec(n))) {
+      var w = m[1];
+      if (/^quotid/.test(w)) { res.every = 1; res.unit = 'jour'; }
+      else if (/^hebdo/.test(w)) { res.every = 1; res.unit = 'semaine'; }
+      else if (/^mensu/.test(w)) { res.every = 1; res.unit = 'mois'; }
+      else if (/^trimes/.test(w)) { res.every = 3; res.unit = 'mois'; }
+      else { res.every = 1; res.unit = 'an'; }
+      add(m);
+    }
+    if (res.unit) {
+      res.kind = 'rec';
+      res.unit = /^jour/.test(res.unit) ? 'day' : /^semaine/.test(res.unit) ? 'week' : /^mois/.test(res.unit) ? 'month' : 'year';
+    }
+
+    // Date
+    var mo = MONTHS.join('|');
+    if (res.date) { /* déjà fixée par « tous les mardis » */ }
+    else if ((m = /\bapres[- ]demain\b/.exec(n))) { res.date = plus(2); add(m); }
+    else if ((m = /\bdemain\b/.exec(n))) { res.date = plus(1); add(m); }
+    else if ((m = /\b(aujourd'hui|ce soir|ce matin|cet apres-midi)\b/.exec(n))) { res.date = plus(0); add(m); }
+    else if ((m = /\bdans (\d+|un|une|deux|trois|quatre|cinq|six) (jours?|semaines?|mois|ans?)\b/.exec(n))) {
+      var words = { un: 1, une: 1, deux: 2, trois: 3, quatre: 4, cinq: 5, six: 6 };
+      var k = words[m[1]] || Number(m[1]);
+      if (/^jour/.test(m[2])) res.date = plus(k);
+      else if (/^semaine/.test(m[2])) res.date = plus(7 * k);
+      else { var mm = M + (/^mois/.test(m[2]) ? k : 12 * k); var yy = Y + Math.floor(mm / 12); mm = ((mm % 12) + 12) % 12; res.date = isoOf(yy, mm, Math.min(D, lastDay(yy, mm))); }
+      add(m);
+    }
+    else if ((m = /\b(?:la )?semaine prochaine\b/.exec(n))) { var dow = new Date(todayUtc).getUTCDay(); res.date = plus(((8 - dow) % 7) || 7); add(m); }
+    else if ((m = /\b(?:a la |en |d'ici la )?fin (?:du|de ce) mois\b/.exec(n))) { res.date = isoOf(Y, M, lastDay(Y, M)); add(m); }
+    else if ((m = /\b(?:le )?(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/.exec(n))) {
+      var dd = Number(m[1]), mmm = Number(m[2]) - 1, y3 = m[3] ? Number(m[3]) : 0;
+      if (y3 && y3 < 100) y3 += 2000;
+      if (mmm >= 0 && mmm < 12 && dd >= 1 && dd <= 31) { res.date = future(y3 || Y, mmm, dd, !!y3); add(m); }
+    }
+    else if ((m = new RegExp('\\b(?:le |du )?(1er|\\d{1,2}) (' + mo + ')(?: (\\d{4}))?\\b').exec(n))) {
+      var d2 = m[1] === '1er' ? 1 : Number(m[1]);
+      res.date = future(m[3] ? Number(m[3]) : Y, MONTHS.indexOf(m[2]), d2, !!m[3]); add(m);
+    }
+    else if ((m = new RegExp('\\b(?:en |au mois d\'|au mois de |d\'ici |debut )(' + mo + ')(?: (\\d{4}))?\\b').exec(n))) {
+      res.date = future(m[2] ? Number(m[2]) : Y, MONTHS.indexOf(m[1]), 1, !!m[2]); add(m);
+    }
+    else if ((m = /\b(?:ce |le |d'ici )?(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)( prochain)?\b/.exec(n))) {
+      var target = WEEKDAYS.indexOf(m[1]), cur = new Date(todayUtc).getUTCDay();
+      var diff = (target - cur + 7) % 7; if (diff === 0) diff = 7;
+      res.date = plus(diff); add(m);
+    }
+    else if ((m = /\b(?:le |avant le )(1er|\d{1,2})\b(?! ?(?:h|heures?|min|minutes?|ans?|jours?|semaines?|mois|%|euros?|€))/.exec(n))) {
+      var d3 = m[1] === '1er' ? 1 : Number(m[1]);
+      if (d3 >= 1 && d3 <= 31) {
+        var cand = isoOf(Y, M, Math.min(d3, lastDay(Y, M)));
+        if (cand < todayIso) { var nm = (M + 1) % 12, ny = M === 11 ? Y + 1 : Y; cand = isoOf(ny, nm, Math.min(d3, lastDay(ny, nm))); }
+        res.date = cand; add(m);
+      }
+    }
+
+    // Priorité
+    if ((m = /\b(urgent|important|prioritaire|en priorite)\b/.exec(n))) { res.prio = true; add(m); }
+
+    // Domaine
+    for (var i = 0; i < DOMAIN_WORDS.length && !res.domain; i++) {
+      var list = DOMAIN_WORDS[i][1];
+      for (var j = 0; j < list.length; j++) {
+        var word = list[j].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (new RegExp('(^|[^a-z])' + word + '([^a-z]|$)').test(n)) { res.domain = DOMAIN_WORDS[i][0]; break; }
+      }
+    }
+
+    // Titre : la phrase sans les morceaux reconnus
+    spans.sort(function (a, b) { return b[0] - a[0]; });
+    var title = src;
+    spans.forEach(function (s) { title = title.slice(0, s[0]) + ' ' + title.slice(s[1]); });
+    title = title.replace(/\s+/g, ' ').replace(/\s+([,.;:!?])/g, '$1').trim();
+    for (var guard = 0; guard < 4; guard++) {
+      var before = title;
+      title = title.replace(/[\s,;:.\-]+$/, '').replace(/\s+(le|la|les|en|pour|a|à|au|d'ici|avant|avant le|et|de|du|des|ce|cette)$/i, '').replace(/^[\s,;:.\-]+/, '');
+      if (title === before) break;
+    }
+    res.title = title ? title.charAt(0).toUpperCase() + title.slice(1) : '';
+    return res;
+  }
+
+  var DOMAINS = ['Général', 'Administratif', 'Santé', 'Finances', 'Logement', 'Famille', 'Travail', 'Carrière', 'Numérique et souvenirs', 'Bien-être'];
+  var DCOL = { 'Général': '#8C97A1', 'Administratif': '#8A6BB8', 'Santé': '#C0504D', 'Finances': '#2E8B6A', 'Logement': '#9C7A54', 'Famille': '#C2668C', 'Travail': '#5B6B7A', 'Carrière': '#C98A1B', 'Numérique et souvenirs': '#3E7CB1', 'Bien-être': '#3F9A9C' };
+  var MAX_PRIO = 3;
+  var TABS = ['aujourdhui', 'ma-vie', 'objectifs', 'coffre'];
+  var UNITS = { day: ['Chaque jour', 'jours'], week: ['Chaque semaine', 'semaines'], month: ['Chaque mois', 'mois'], year: ['Chaque année', 'ans'] };
+  var HOR_ORDER = ['Cette année', "D'ici 3 ans", 'Plus tard'];
+  var JOURS = ['Dim', 'Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'];
+  var JOURS_LONG = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
+  var MOIS_C = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
+  var MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+  var ESSENTIALS = {
+    'Administratif': ["Carte d'identité", 'Passeport', 'Permis de conduire', 'Carte grise', 'Acte de naissance', "Avis d'imposition", 'Diplômes'],
+    'Santé': ['Carte Vitale', 'Carte de mutuelle', 'Carnet de santé et vaccinations', 'Ordonnances', "Résultats d'analyses", "Comptes rendus d'examens", 'Coordonnées des médecins'],
+    'Finances': ['RIB', 'Relevés bancaires', 'Contrats de prêt', "Contrats d'épargne", "Contrats d'assurance"],
+    'Logement': ['Bail ou acte de propriété', 'Assurance habitation', "Factures d'énergie", 'Garanties et factures des appareils', 'Double des clés'],
+    'Famille': ['Livret de famille', 'Contrat de mariage ou PACS', 'Documents des enfants'],
+    'Travail': ['Contrat de travail', 'Fiches de paie', 'Attestations employeur', 'Badge et matériel professionnel'],
+    'Carrière': ['CV à jour', 'Certificats de formation', 'Lettres de recommandation'],
+    'Numérique et souvenirs': ['Photos', 'Vidéos', 'Disque dur de sauvegarde', 'Clés USB', 'Gestionnaire de mots de passe']
+  };
+
+  var vieDomain = 'all';
+  var kindFilter = 'all';
+  var editing = null, editingRec = null, editingItem = null, editingSite = null, editingGoal = null;
+  var lastParse = null;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function today() { return new Date().toLocaleDateString('sv-SE'); }
+  function parseD(s) { var p = String(s).split('-').map(Number); return new Date(Date.UTC(p[0], p[1] - 1, p[2])); }
+  function iso(d) { return d.toISOString().slice(0, 10); }
+  function addDays(s, n) { var d = parseD(s); d.setUTCDate(d.getUTCDate() + n); return iso(d); }
+  function step(s, every, unit) {
+    var d = parseD(s), n = Math.max(1, Number(every) || 1);
+    if (unit === 'day') d.setUTCDate(d.getUTCDate() + n);
+    else if (unit === 'week') d.setUTCDate(d.getUTCDate() + 7 * n);
+    else {
+      var day = d.getUTCDate();
+      d.setUTCDate(1);
+      d.setUTCMonth(d.getUTCMonth() + (unit === 'year' ? 12 * n : n));
+      d.setUTCDate(Math.min(day, new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate()));
+    }
+    return iso(d);
+  }
+  function fmtDate(s) { var p = String(s).split('-'); return p.length === 3 ? p[2] + '/' + p[1] + '/' + p[0] : s; }
+  function fmtShort(s) { var d = parseD(s); return JOURS[d.getUTCDay()].toLowerCase() + '. ' + d.getUTCDate() + ' ' + MOIS_C[d.getUTCMonth()] + (d.getUTCFullYear() !== parseD(today()).getUTCFullYear() ? ' ' + d.getUTCFullYear() : ''); }
+  function euros(n) { return (Number(n) || 0).toLocaleString('fr-FR', { style: 'currency', currency: 'EUR' }); }
+  function relDays(s) {
+    var n = Math.round((parseD(s) - parseD(today())) / 86400000);
+    if (n === 0) return "aujourd'hui";
+    if (n === 1) return 'demain';
+    if (n === -1) return 'hier';
+    return n < 0 ? 'il y a ' + (-n) + ' j' : 'dans ' + n + ' j';
+  }
+  function norm(s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, ' ').trim(); }
+  function hasItem(items, name) { var n = norm(name); return items.some(function (i) { var m = norm(i.name); return m === n || (' ' + m + ' ').indexOf(' ' + n + ' ') !== -1; }); }
+  function dom(r) { return DOMAINS.indexOf(r && r.domain) !== -1 ? r.domain : 'Général'; }
+  function plural(n, one, many) { return n + ' ' + (n > 1 ? many : one); }
+
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function msg(text) { return el('div', 'pd-empty', text); }
+  function pill(text, cls) { return el('span', 'pd-pill' + (cls ? ' ' + cls : ''), text); }
+  function dotEl(d) { var s = el('span', 'pd-dot'); s.style.background = DCOL[d] || DCOL['Général']; return s; }
+  function domPill(d) { var p = pill(d); p.prepend(dotEl(d)); return p; }
+  function btn(text, cls, fn, aria) { var b = el('button', cls, text); b.type = 'button'; if (aria) b.setAttribute('aria-label', aria); b.onclick = fn; return b; }
+  function showAlert(sel, on) { document.querySelectorAll(sel).forEach(function (p) { p.hidden = !on; }); }
+  function rows(id) { var s = dash.data(id); return s.status === 'ok' && Array.isArray(s.data) ? s.data : null; }
+  function rowsOr(id) { return rows(id) || []; }
+  function placeholder(el_, id, label) {
+    var s = dash.data(id);
+    if (s.status === 'ok') return false;
+    el_.replaceChildren(msg(s.status === 'loading' ? 'Chargement…' : s.status === 'error' ? label + " n'ont pas pu être chargé(e)s." : '—'));
+    return true;
+  }
+
+  async function run(fn) {
+    var ok = true;
+    try {
+      var parts = await Promise.all([claude.use('db'), claude.use('user')]);
+      if (!parts[0] || !parts[1]) throw new Error('indisponible');
+      await fn(parts[0], 'data/users/' + (await parts[1].id()));
+    } catch (e) { ok = false; }
+    showAlert('.pd-unsaved-msg', !ok);
+    return ok;
+  }
+  function upd(coll, id, data) { return run(function (db, base) { return db.doc(base + '/' + coll + '/items/' + id).update(data); }); }
+  function del(coll, id) { return run(function (db, base) { return db.doc(base + '/' + coll + '/items/' + id).delete(); }); }
+  function addTo(coll, row) { return run(function (db, base) { return db.collection(base + '/' + coll + '/items').add(row); }); }
+
+  /* ---------- Calculs ---------- */
+  dash.calc('stats', {
+    inputs: ['tasks', 'recurring'],
+    title: 'Synthèse de la semaine',
+    description: "Tâches ouvertes en retard, à faire d'ici 7 jours, priorités, et échéances récurrentes d'ici 7 jours.",
+    fn: function (tasks, recurring) {
+      var t = new Date().toLocaleDateString('sv-SE');
+      var d = new Date(); d.setDate(d.getDate() + 7);
+      var in7 = d.toLocaleDateString('sv-SE');
+      var open = tasks.filter(function (x) { return !x.done; });
+      return [{
+        late: open.filter(function (x) { return x.due && x.due < t; }).length,
+        week: open.filter(function (x) { return x.due && x.due >= t && x.due <= in7; }).length,
+        prio: open.filter(function (x) { return x.prio; }).length,
+        rec7: recurring.filter(function (x) { return x.next && x.next <= in7; }).length
+      }];
+    }
+  });
+  dash.calc('subs', {
+    inputs: ['sites'],
+    title: 'Synthèse des comptes',
+    description: 'Comptes actifs, comptes à fermer et total des abonnements mensuels (hors comptes fermés).',
+    fn: function (sites) {
+      return [{
+        actifs: sites.filter(function (s) { return !s.status || s.status === 'Actif'; }).length,
+        afermer: sites.filter(function (s) { return s.status === 'À fermer'; }).length,
+        mensuel: Math.round(sites.filter(function (s) { return s.status !== 'Fermé'; }).reduce(function (a, s) { return a + (Number(s.cost) || 0); }, 0) * 100) / 100
+      }];
+    }
+  });
+  dash.calc('inv', {
+    inputs: ['items'],
+    title: "Avancement de l'inventaire",
+    description: "Nombre d'essentiels de la liste guidée déjà inventoriés, et nombre total d'éléments notés.",
+    fn: function (items) {
+      var all = [];
+      Object.keys(ESSENTIALS).forEach(function (d) { all = all.concat(ESSENTIALS[d]); });
+      return [{ done: all.filter(function (n) { return hasItem(items, n); }).length, total: all.length, count: items.length }];
+    }
+  });
+  dash.calc('goalprog', {
+    inputs: ['goals', 'tasks'],
+    title: 'Avancement des objectifs',
+    description: "Pour chaque objectif : nombre d'étapes (tâches liées) terminées sur le total.",
+    fn: function (goals, tasks) {
+      return goals.map(function (g) {
+        var steps = tasks.filter(function (x) { return x.goalId === g.id; });
+        var done = steps.filter(function (x) { return x.done; }).length;
+        return { id: g.id, done: done, total: steps.length, pct: steps.length ? Math.round(100 * done / steps.length) : 0 };
+      });
+    }
+  });
+
+  function drawNum(name, src, field, fmt) {
+    dash.draw(name, function (e) {
+      var s = dash.data(src);
+      e.textContent = (s.status === 'ok' && s.data && s.data[0]) ? (fmt ? fmt(s.data[0][field]) : String(s.data[0][field])) : '—';
+    });
+  }
+  drawNum('inv-done', 'inv', 'done'); drawNum('inv-total', 'inv', 'total');
+  drawNum('inv-done2', 'inv', 'done'); drawNum('inv-total2', 'inv', 'total'); drawNum('inv-count', 'inv', 'count');
+  drawNum('c-actifs', 'subs', 'actifs'); drawNum('c-fermer', 'subs', 'afermer'); drawNum('c-cout', 'subs', 'mensuel', euros); drawNum('c-cout2', 'subs', 'mensuel', euros);
+  drawNum('h-week', 'stats', 'week', function (n) { return n === 0 ? 'Rien à faire' : plural(n, 'chose à faire', 'choses à faire'); });
+  drawNum('h-late', 'stats', 'late', function (n) { return n === 0 ? 'rien en retard' : plural(n, 'tâche en retard', 'tâches en retard'); });
+
+  dash.draw('today-label', function (e) { var d = parseD(today()); e.textContent = JOURS_LONG[d.getUTCDay()] + ' ' + d.getUTCDate() + ' ' + MOIS[d.getUTCMonth()]; });
+
+  /* ---------- Lignes réutilisables ---------- */
+  function sortTasks(a, b) {
+    if (!!a.done !== !!b.done) return a.done ? 1 : -1;
+    if (!!a.prio !== !!b.prio) return a.prio ? -1 : 1;
+    var da = a.due || '9999', db_ = b.due || '9999';
+    if (da !== db_) return da < db_ ? -1 : 1;
+    return String(a.title || '').localeCompare(String(b.title || ''), 'fr');
+  }
+  function openPrioCount() { return rowsOr('tasks').filter(function (x) { return !x.done && x.prio; }).length; }
+  function goalTitle(id) { var g = rowsOr('goals').filter(function (x) { return x.id === id; })[0]; return g ? String(g.title || '') : ''; }
+  function toggleStar(r) {
+    if (!r.prio && openPrioCount() >= MAX_PRIO) { showAlert('.pd-prio-msg', true); return; }
+    showAlert('.pd-prio-msg', false);
+    upd('tasks', r.id, { prio: !r.prio });
+  }
+  function toggleDone(r, done) { var d = { done: done }; if (done) d.doneAt = today(); upd('tasks', r.id, d); }
+
+  function taskRow(r, opts) {
+    opts = opts || {};
+    var t = today();
+    var row = el('div', 'pd-row' + (r.done ? ' pd-done' : ''));
+    var cb = el('input'); cb.type = 'checkbox'; cb.checked = !!r.done; cb.setAttribute('aria-label', 'Terminée : ' + (r.title || ''));
+    cb.onchange = function () { toggleDone(r, cb.checked); };
+    var main = el('span', 'pd-main');
+    main.append(btn(r.title || '(sans titre)', 'pd-t', function () { openEdit(r); }));
+    if (r.note && !opts.compact) main.append(el('span', 'pd-note', r.note));
+    row.append(cb, main);
+    if (!opts.noDomain) row.append(domPill(dom(r)));
+    if (r.goalId && !opts.compact) { var gt = goalTitle(r.goalId); if (gt) row.append(pill('Objectif : ' + (gt.length > 26 ? gt.slice(0, 25) + '…' : gt), 'pd-acc')); }
+    if (r.due) {
+      var late = !r.done && r.due < t, soon = !r.done && !late && r.due <= addDays(t, 2);
+      row.append(pill((late ? 'En retard · ' : '') + fmtShort(r.due), late ? 'pd-late' : soon ? 'pd-soon' : ''));
+    }
+    var star = btn(r.prio ? '★' : '☆', 'pd-icon pd-star', function () { toggleStar(r); }, (r.prio ? 'Retirer des priorités : ' : 'Mettre en priorité : ') + (r.title || ''));
+    star.setAttribute('aria-pressed', r.prio ? 'true' : 'false');
+    row.append(star);
+    return row;
+  }
+
+  function recRow(r, opts) {
+    opts = opts || {};
+    var t = today();
+    var row = el('div', 'pd-row');
+    var main = el('span', 'pd-main');
+    main.append(btn(r.title || '', 'pd-t', function () { openRec(r); }));
+    var u = UNITS[r.unit] || UNITS.month, every = Number(r.every) || 1;
+    if (!opts.compact) main.append(el('span', 'pd-note', (every > 1 ? 'Tous les ' + every + ' ' + u[1] : u[0]) + (r.lastDone ? ' · fait le ' + fmtDate(r.lastDone) : '')));
+    row.append(main);
+    if (!opts.noDomain) row.append(domPill(dom(r)));
+    if (r.next) { var late = r.next < t, soon = !late && r.next <= addDays(t, 7); row.append(pill(fmtShort(r.next) + ' · ' + relDays(r.next), late ? 'pd-late' : soon ? 'pd-soon' : '')); }
+    row.append(btn('Fait', '', function () { recDone(r); }, 'Fait : ' + (r.title || '') + '. Programmer la prochaine fois.'));
+    return row;
+  }
+  function recDone(r) {
+    var t = today(), next = r.next || t;
+    do { next = step(next, r.every, r.unit); } while (next <= t);
+    upd('recurring', r.id, { next: next, lastDone: t });
+  }
+  function sortRec(a, b) { var x = a.next || '9999', y = b.next || '9999'; return x < y ? -1 : x > y ? 1 : 0; }
+
+  function itemRow(r, opts) {
+    opts = opts || {};
+    var t = today();
+    var row = el('div', 'pd-row');
+    var main = el('span', 'pd-main');
+    main.append(btn(r.name || '(sans nom)', 'pd-t', function () { openItem(r); }));
+    main.append(el('span', 'pd-note', r.place ? 'Où : ' + r.place : 'Emplacement non renseigné'));
+    if (r.note && !opts.compact) main.append(el('span', 'pd-note', r.note));
+    row.append(main);
+    if (r.kind && !opts.compact) row.append(pill(r.kind));
+    if (r.expiry) { var late = r.expiry < t, soon = !late && r.expiry <= addDays(t, 90); row.append(pill((late ? 'Expiré · ' : "Valable jusqu'au ") + fmtDate(r.expiry), late ? 'pd-late' : soon ? 'pd-soon' : '')); }
+    if (!r.place) row.append(pill('À localiser', 'pd-soon'));
+    return row;
+  }
+
+  function siteRow(r, opts) {
+    opts = opts || {};
+    var row = el('div', 'pd-row');
+    var main = el('span', 'pd-main');
+    main.append(btn(r.name || '', 'pd-t', function () { openSite(r); }));
+    var sub = [r.email, /^https?:\/\//i.test(String(r.url || '')) ? String(r.url).replace(/^https?:\/\//i, '').replace(/\/$/, '') : ''].filter(Boolean).join(' · ');
+    if (sub) main.append(el('span', 'pd-note', sub));
+    row.append(main);
+    if (Number(r.cost) > 0) row.append(pill(euros(r.cost) + '/mois'));
+    if (r.status && r.status !== 'Actif') row.append(pill(r.status, r.status === 'À fermer' ? 'pd-soon' : ''));
+    if (!opts.compact && /^https?:\/\//i.test(String(r.url || ''))) {
+      var a = el('a', '', 'Ouvrir'); a.href = r.url; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.style.fontSize = '13px';
+      row.append(a);
+    }
+    return row;
+  }
+
+  function progOf(id) {
+    var p = dash.data('goalprog');
+    var row = p.status === 'ok' && p.data ? p.data.filter(function (x) { return x.id === id; })[0] : null;
+    return row || { done: 0, total: 0, pct: 0 };
+  }
+  function bar(pct) { var b = el('div', 'pd-bar'), s = el('span'); s.style.width = Math.max(0, Math.min(100, pct)) + '%'; b.append(s); return b; }
+  function activeGoals(goals) { return goals.filter(function (g) { return !g.status || g.status === 'En cours'; }).sort(function (a, b) { return HOR_ORDER.indexOf(a.horizon) - HOR_ORDER.indexOf(b.horizon); }); }
+  function goalLine(g) {
+    var p = progOf(g.id);
+    var row = el('div', 'pd-row');
+    var main = el('span', 'pd-main');
+    main.append(btn(g.title || '', 'pd-t', function () { goTab('objectifs'); setSub('obj-seg', 'obj-liste'); }), bar(p.pct));
+    row.append(main, pill(p.total ? p.done + ' / ' + p.total + ' étapes' : 'Aucune étape', p.total ? '' : 'pd-soon'));
+    return row;
+  }
+
+  /* ---------- Accueil ---------- */
+  dash.onData(function () {
+    var t = today(), tasks = rows('tasks'), items = rows('items');
+    var anyLate = !!tasks && tasks.some(function (r) { return !r.done && r.due && r.due < t; });
+    document.querySelectorAll('#retards').forEach(function (b) { b.hidden = !anyLate; });
+    var lim = addDays(t, 90);
+    var anyExp = !!items && items.some(function (r) { return r.expiry && r.expiry <= lim; });
+    document.querySelectorAll('#a-renouveler').forEach(function (b) { b.hidden = !anyExp; });
+  });
+
+  dash.draw('late-strip', function (e) {
+    var t = today();
+    var late = rowsOr('tasks').filter(function (r) { return !r.done && r.due && r.due < t; }).sort(sortTasks);
+    e.replaceChildren.apply(e, late.slice(0, 6).map(function (r) { return btn(r.title + ' (' + fmtShort(r.due) + ')', 'pd-icon', function () { openEdit(r); }); }));
+  });
+
+  dash.draw('slots', function (e) {
+    if (placeholder(e, 'tasks', 'Les tâches')) return;
+    var prios = rowsOr('tasks').filter(function (r) { return !r.done && r.prio; }).sort(sortTasks).slice(0, MAX_PRIO);
+    var nodes = [];
+    for (var i = 0; i < MAX_PRIO; i++) {
+      var r = prios[i];
+      if (!r) {
+        var free = el('div', 'pd-slot pd-free');
+        free.append(el('span', 'pd-slot-n', String(i + 1)), el('span', '', i === 0 ? 'Emplacement libre. Étoilez une tâche dans Ma vie ou pendant la revue.' : 'Emplacement libre'));
+        nodes.push(free);
+        continue;
+      }
+      (function (r) {
+        var s = el('div', 'pd-slot pd-full');
+        var top = el('div', 'pd-form');
+        var cb = el('input'); cb.type = 'checkbox'; cb.setAttribute('aria-label', 'Terminée : ' + r.title); cb.onchange = function () { toggleDone(r, cb.checked); };
+        top.append(cb, domPill(dom(r)));
+        if (r.due) top.append(pill(fmtShort(r.due), r.due < today() ? 'pd-late' : ''));
+        s.append(top, btn(r.title || '', 'pd-t', function () { openEdit(r); }), btn('Retirer des priorités', 'pd-icon', function () { toggleStar(r); }));
+        s.lastChild.style.justifySelf = 'start';
+        s.lastChild.style.fontSize = '12px';
+        nodes.push(s);
+      })(r);
+    }
+    e.replaceChildren.apply(e, nodes);
+  });
+
+  dash.draw('week', function (e) {
+    if (placeholder(e, 'tasks', 'Les tâches')) return;
+    var t = today(), tasks = rowsOr('tasks').filter(function (r) { return !r.done && r.due; }), rec = rowsOr('recurring');
+    var nodes = [];
+    for (var i = 0; i < 7; i++) {
+      var dIso = addDays(t, i), d = parseD(dIso);
+      var box = el('div', 'pd-day' + (i === 0 ? ' pd-today' : ''));
+      var h = el('div', 'pd-day-h'); h.append(el('b', '', i === 0 ? "Aujourd'hui" : JOURS[d.getUTCDay()]), el('span', '', String(d.getUTCDate())));
+      box.append(h);
+      tasks.filter(function (r) { return r.due === dIso; }).sort(sortTasks).forEach(function (r) {
+        var b = btn('', 'pd-chipitem', function () { openEdit(r); }, (r.prio ? 'Priorité : ' : '') + r.title);
+        b.append(el('span', 'pd-clamp', (r.prio ? '★ ' : '') + r.title));
+        b.style.background = 'color-mix(in srgb, ' + DCOL[dom(r)] + ' 15%, var(--color-bg))';
+        box.append(b);
+      });
+      rec.filter(function (r) { return r.next === dIso; }).forEach(function (r) {
+        var b = btn('', 'pd-chipitem', function () { openRec(r); }, 'Échéance récurrente : ' + r.title);
+        b.append(el('span', 'pd-clamp', '↻ ' + r.title));
+        b.style.background = 'color-mix(in srgb, var(--color-warn) 16%, var(--color-bg))';
+        box.append(b);
+      });
+      nodes.push(box);
+    }
+    e.replaceChildren.apply(e, nodes);
+  });
+
+  function domainSummary(d) {
+    var t = today(), in30 = addDays(t, 30);
+    var nt = rowsOr('tasks').filter(function (r) { return !r.done && dom(r) === d; }).length;
+    var late = rowsOr('tasks').filter(function (r) { return !r.done && dom(r) === d && r.due && r.due < t; }).length;
+    var nr = rowsOr('recurring').filter(function (r) { return dom(r) === d && r.next && r.next <= in30; }).length;
+    var ni = rowsOr('items').filter(function (r) { return dom(r) === d; }).length;
+    var ns = rowsOr('sites').filter(function (r) { return dom(r) === d && r.status !== 'Fermé'; }).length;
+    var parts = [];
+    if (nt) parts.push(plural(nt, 'tâche', 'tâches'));
+    if (nr) parts.push(plural(nr, 'échéance', 'échéances'));
+    if (ni) parts.push(plural(ni, 'document', 'documents'));
+    if (ns) parts.push(plural(ns, 'compte', 'comptes'));
+    return { text: parts.length ? parts.join(' · ') : 'Rien en cours', late: late, weight: nt + nr };
+  }
+
+  dash.draw('tiles', function (e) {
+    if (placeholder(e, 'tasks', 'Les données')) return;
+    var list = DOMAINS.map(function (d) { return { d: d, s: domainSummary(d) }; });
+    list.sort(function (a, b) { return b.s.weight - a.s.weight; });
+    e.replaceChildren.apply(e, list.map(function (x) {
+      var b = el('button', 'pd-tile'); b.type = 'button';
+      var name = el('span', 'pd-tile-name'); name.append(dotEl(x.d), document.createTextNode(x.d));
+      b.append(name, el('span', 'pd-small', x.s.text));
+      if (x.s.late) b.append(pill(plural(x.s.late, 'en retard', 'en retard'), 'pd-late'));
+      b.onclick = function () { setVieDomain(x.d); goTab('ma-vie'); };
+      return b;
+    }));
+  });
+
+  dash.draw('home-goals', function (e) {
+    if (placeholder(e, 'goals', 'Les objectifs')) return;
+    var act = activeGoals(rowsOr('goals'));
+    if (!act.length) { e.replaceChildren(el('p', 'pd-small', "Aucun objectif en cours. Notez les deux ou trois choses que vous voulez faire avancer cette année.")); return; }
+    e.replaceChildren.apply(e, act.slice(0, 4).map(function (g) {
+      var p = progOf(g.id), box = el('div', 'pd-block'); box.style.gap = '4px';
+      var head = el('div', 'pd-head'); head.append(el('span', '', g.title || ''), el('span', 'pd-small', p.total ? p.done + '/' + p.total : '0 étape'));
+      box.append(head, bar(p.pct));
+      return box;
+    }));
+  });
+
+  dash.draw('inv-bar', function (e) {
+    var s = dash.data('inv');
+    var r = s.status === 'ok' && s.data && s.data[0];
+    var sp = el('span'); sp.style.width = r && r.total ? Math.round(100 * r.done / r.total) + '%' : '0%';
+    e.replaceChildren(sp);
+  });
+  dash.draw('inv-next', function (e) {
+    var items = rows('items');
+    if (!items) { e.textContent = '—'; return; }
+    var miss = [];
+    Object.keys(ESSENTIALS).forEach(function (d) { ESSENTIALS[d].forEach(function (n) { if (!hasItem(items, n)) miss.push(n); }); });
+    var toPlace = items.filter(function (r) { return !r.place; }).length;
+    e.textContent = (miss.length ? 'Prochains à noter : ' + miss.slice(0, 3).join(', ') + '.' : 'Tous les essentiels sont notés.') + (toPlace ? ' ' + plural(toPlace, 'élément', 'éléments') + ' à localiser.' : '');
+  });
+
+  dash.draw('home-exp', function (e) {
+    if (placeholder(e, 'items', "Les éléments du coffre")) return;
+    var lim = addDays(today(), 90);
+    var list = rowsOr('items').filter(function (r) { return r.expiry && r.expiry <= lim; }).sort(function (a, b) { return a.expiry < b.expiry ? -1 : 1; });
+    e.replaceChildren.apply(e, list.length ? list.map(function (r) { return itemRow(r, { compact: true }); }) : [msg('Aucun document à renouveler.')]);
+  });
+
+  /* ---------- Saisie en langage naturel ---------- */
+  function fillPreview() {
+    var text = $('c-text').value;
+    var on = !!text.trim();
+    $('c-preview').hidden = !on;
+    $('c-title-line').hidden = !on;
+    showAlert('.pd-cdate-msg', false);
+    showAlert('.pd-cok-msg', false);
+    if (!on) { lastParse = null; dash.draw('c-title'); return; }
+    var p = parseCapture(text, today());
+    lastParse = p;
+    $('c-kind').value = p.kind;
+    $('c-domain').value = p.domain || (vieDomain !== 'all' ? vieDomain : 'Général');
+    $('c-date').value = p.date || '';
+    $('c-every').value = String(p.every || 1);
+    $('c-unit').value = p.unit || 'month';
+    $('c-prio').checked = !!p.prio;
+    syncKind();
+    dash.draw('c-title');
+  }
+  function syncKind() {
+    var k = $('c-kind').value;
+    document.querySelectorAll('.pd-c-rec').forEach(function (x) { x.hidden = k !== 'rec'; });
+    var dl = $('c-date').closest('label'); if (dl) dl.hidden = k === 'search';
+    var pl = $('c-prio').closest('label'); if (pl) pl.hidden = k !== 'task';
+    var dm = $('c-domain').closest('label'); if (dm) dm.hidden = k === 'search';
+  }
+  dash.draw('c-title', function (e) { e.textContent = lastParse ? (lastParse.title || $('c-text').value.trim()) : '—'; });
+
+  $('c-text').addEventListener('input', fillPreview);
+  $('c-kind').addEventListener('change', syncKind);
+  $('capture').addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    var text = $('c-text').value.trim();
+    if (!text) return;
+    var p = lastParse || parseCapture(text, today());
+    var kind = $('c-kind').value, title = p.title || text;
+    if (kind === 'search') { $('q').value = p.title || text; runSearch(); $('c-text').value = ''; fillPreview(); return; }
+    var ok;
+    if (kind === 'rec') {
+      if (!$('c-date').value) { showAlert('.pd-cdate-msg', true); $('c-date').focus(); return; }
+      ok = await addTo('recurring', { title: title, domain: $('c-domain').value, next: $('c-date').value, every: Math.max(1, Number($('c-every').value) || 1), unit: $('c-unit').value, created: new Date().toISOString() });
+    } else {
+      var prio = $('c-prio').checked;
+      if (prio && openPrioCount() >= MAX_PRIO) { showAlert('.pd-prio-msg', true); prio = false; }
+      ok = await addTo('tasks', { title: title, domain: $('c-domain').value, due: $('c-date').value || '', done: false, prio: prio, created: new Date().toISOString() });
+    }
+    if (ok) { $('c-text').value = ''; fillPreview(); showAlert('.pd-cok-msg', true); }
+  });
+
+  /* ---------- Recherche globale ---------- */
+  function runSearch() {
+    var on = !!$('q').value.trim();
+    $('resultats').hidden = !on;
+    redrawIn($('resultats'));
+    if (on) $('resultats').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  $('q').addEventListener('input', function () { $('resultats').hidden = !$('q').value.trim(); dash.draw('search'); });
+  $('q-clear').addEventListener('click', function () { $('q').value = ''; $('resultats').hidden = true; });
+  dash.draw('search', function (e) {
+    var q = norm($('q') ? $('q').value : '');
+    if (!q) { e.replaceChildren(); return; }
+    var words = q.split(' ');
+    function hit(parts) { var h = norm(parts.join(' ')); return words.every(function (w) { return h.indexOf(w) !== -1; }); }
+    var groups = [
+      ['Tâches', rowsOr('tasks').filter(function (r) { return hit([r.title, r.note, r.domain, goalTitle(r.goalId)]); }).sort(sortTasks).map(function (r) { return taskRow(r); })],
+      ['Coffre', rowsOr('items').filter(function (r) { return hit([r.name, r.place, r.note, r.domain, r.kind]); }).map(function (r) { return itemRow(r); })],
+      ['Comptes', rowsOr('sites').filter(function (r) { return hit([r.name, r.url, r.email, r.domain, r.note, r.status]); }).map(function (r) { return siteRow(r); })],
+      ['Échéances récurrentes', rowsOr('recurring').filter(function (r) { return hit([r.title, r.domain]); }).sort(sortRec).map(function (r) { return recRow(r); })],
+      ['Objectifs', rowsOr('goals').filter(function (r) { return hit([r.title, r.why, r.domain]); }).map(goalLine)]
+    ];
+    var nodes = [];
+    groups.forEach(function (g) { if (g[1].length) { nodes.push(el('div', 'pd-group', g[0] + ' · ' + g[1].length)); nodes = nodes.concat(g[1]); } });
+    e.replaceChildren.apply(e, nodes.length ? nodes : [msg('Rien ne correspond. Essayez un autre mot, ou ajoutez-le depuis l\'accueil.')]);
+  });
+
+  /* ---------- Ma vie ---------- */
+  function setVieDomain(d) {
+    vieDomain = d;
+    if (d !== 'all') $('t-domain').value = d;
+    ['vie-chips', 'tasklist', 'vie-rec', 'vie-items', 'vie-sites', 'vie-goals'].forEach(function (n) { dash.draw(n); });
+  }
+  dash.draw('vie-chips', function (e) {
+    var open = rowsOr('tasks').filter(function (r) { return !r.done; });
+    var all = btn('Tous · ' + open.length, vieDomain === 'all' ? 'pd-on' : '', function () { setVieDomain('all'); });
+    var nodes = [all];
+    DOMAINS.forEach(function (d) {
+      var n = open.filter(function (r) { return dom(r) === d; }).length;
+      var b = btn(d + (n ? ' · ' + n : ''), vieDomain === d ? 'pd-on' : '', function () { setVieDomain(d); });
+      b.prepend(dotEl(d));
+      nodes.push(b);
+    });
+    e.replaceChildren.apply(e, nodes);
+  });
+  function inDom(r) { return vieDomain === 'all' || dom(r) === vieDomain; }
+  dash.draw('tasklist', function (e) {
+    if (placeholder(e, 'tasks', 'Les tâches')) return;
+    var showDone = $('t-showdone') && $('t-showdone').checked;
+    var all = rowsOr('tasks').filter(inDom);
+    var list = all.filter(function (r) { return showDone || !r.done; }).sort(sortTasks);
+    if (!list.length) { e.replaceChildren(msg(all.length ? 'Tout est fait ici. Cochez « Afficher les tâches terminées » pour les revoir.' : 'Aucune tâche dans ce domaine. Ajoutez-en une ci-dessus ou depuis l\'accueil.')); return; }
+    e.replaceChildren.apply(e, list.map(function (r) { return taskRow(r, { noDomain: vieDomain !== 'all' }); }));
+  });
+  function miniList(e, list, empty, toRow, more) {
+    var nodes = list.slice(0, 5).map(toRow);
+    var out;
+    if (!nodes.length) out = [el('p', 'pd-small', empty)];
+    else { var wrap = el('div', 'pd-list'); wrap.append.apply(wrap, nodes); out = [wrap]; if (list.length > 5) out.push(el('p', 'pd-small', 'Et ' + (list.length - 5) + ' autre(s).')); }
+    if (more) out.push(more);
+    e.replaceChildren.apply(e, out);
+  }
+  function gotoBtn(label, tab, sub) { var b = btn(label, 'pd-icon', function () { goTab(tab); if (sub) setSub(sub[0], sub[1]); }); b.style.justifySelf = 'start'; b.style.fontSize = '12px'; return b; }
+  dash.draw('vie-rec', function (e) {
+    if (placeholder(e, 'recurring', 'Les échéances')) return;
+    miniList(e, rowsOr('recurring').filter(inDom).sort(sortRec), 'Aucune échéance récurrente.', function (r) { return recRow(r, { compact: true, noDomain: vieDomain !== 'all' }); }, gotoBtn('Toutes les échéances', 'coffre', ['coffre-seg', 'cof-rec']));
+  });
+  dash.draw('vie-items', function (e) {
+    if (placeholder(e, 'items', 'Les éléments')) return;
+    miniList(e, rowsOr('items').filter(inDom).sort(function (a, b) { return String(a.name).localeCompare(String(b.name), 'fr'); }), 'Aucun document noté.', function (r) { return itemRow(r, { compact: true }); }, gotoBtn('Ouvrir le coffre', 'coffre', ['coffre-seg', 'cof-inv']));
+  });
+  dash.draw('vie-sites', function (e) {
+    if (placeholder(e, 'sites', 'Les comptes')) return;
+    miniList(e, rowsOr('sites').filter(function (r) { return inDom(r) && r.status !== 'Fermé'; }), 'Aucun compte noté.', function (r) { return siteRow(r, { compact: true }); }, gotoBtn('Tous les comptes', 'coffre', ['coffre-seg', 'cof-comptes']));
+  });
+  dash.draw('vie-goals', function (e) {
+    if (placeholder(e, 'goals', 'Les objectifs')) return;
+    miniList(e, activeGoals(rowsOr('goals')).filter(inDom), 'Aucun objectif en cours.', goalLine, gotoBtn('Tous les objectifs', 'objectifs', ['obj-seg', 'obj-liste']));
+  });
+
+  /* ---------- Objectifs ---------- */
+  dash.draw('goal-opts', function (sel) {
+    var keep = sel.value || (editing && editing.goalId) || '';
+    var opts = [new Option('Aucun', '')];
+    rowsOr('goals').forEach(function (g) { opts.push(new Option(String(g.title || ''), g.id)); });
+    sel.replaceChildren.apply(sel, opts);
+    sel.value = keep;
+  });
+  dash.draw('goallist', function (e) {
+    if (placeholder(e, 'goals', 'Les objectifs')) return;
+    var goals = rowsOr('goals');
+    var showAll = $('g-showall') && $('g-showall').checked;
+    var list = showAll ? goals.slice().sort(function (a, b) { return HOR_ORDER.indexOf(a.horizon) - HOR_ORDER.indexOf(b.horizon); }) : activeGoals(goals);
+    if (!list.length) { e.replaceChildren(msg(goals.length ? 'Aucun objectif en cours.' : 'Aucun objectif pour le moment. Ajoutez-en un ci-dessus.')); return; }
+    var tasks = rowsOr('tasks');
+    e.replaceChildren.apply(e, list.map(function (g) {
+      var p = progOf(g.id), card = el('div', 'pd-card');
+      var head = el('div', 'pd-goal-head');
+      head.append(btn(g.title || '', 'pd-t', function () { openGoal(g); }), domPill(dom(g)));
+      if (g.horizon) head.append(pill(g.horizon));
+      if (g.status && g.status !== 'En cours') head.append(pill(g.status, g.status === 'Atteint' ? 'pd-ok' : ''));
+      card.append(head);
+      if (g.why) card.append(el('p', 'pd-note', g.why));
+      card.append(bar(p.pct), el('span', 'pd-small', p.total ? plural(p.done, 'étape terminée', 'étapes terminées') + ' sur ' + p.total + ' · ' + p.pct + ' %' : "Pas encore d'étape"));
+      var steps = tasks.filter(function (x) { return x.goalId === g.id && !x.done; }).sort(sortTasks);
+      if (steps.length) { var l = el('div', 'pd-list'); steps.forEach(function (s) { l.append(taskRow(s, { compact: true, noDomain: true })); }); card.append(l); }
+      var f = el('form', 'pd-form');
+      var inp = el('input'); inp.type = 'text'; inp.className = 'pd-grow'; inp.placeholder = 'Prochaine étape'; inp.setAttribute('aria-label', 'Nouvelle étape pour : ' + (g.title || ''));
+      var due = el('input'); due.type = 'date'; due.setAttribute('aria-label', "Échéance de l'étape");
+      var b = el('button', '', "Ajouter l'étape"); b.type = 'submit';
+      f.append(inp, due, b);
+      f.onsubmit = async function (ev) {
+        ev.preventDefault();
+        var v = inp.value.trim(); if (!v) return;
+        if (await addTo('tasks', { title: v, domain: dom(g), due: due.value || '', done: false, prio: false, goalId: g.id, created: new Date().toISOString() })) { inp.value = ''; due.value = ''; }
+      };
+      card.append(f);
+      return card;
+    }));
+  });
+
+  /* ---------- Revue ---------- */
+  dash.draw('rv-done', function (e) {
+    if (placeholder(e, 'tasks', 'Les tâches')) return;
+    var since = addDays(today(), -7);
+    var list = rowsOr('tasks').filter(function (r) { return r.done && r.doneAt && r.doneAt >= since; });
+    e.replaceChildren.apply(e, list.length ? list.map(function (r) { return taskRow(r, { compact: true }); }) : [msg('Aucune tâche cochée ces 7 derniers jours. Notez ci-dessous ce que vous avez fait malgré tout.')]);
+  });
+  dash.draw('rv-late', function (e) {
+    if (placeholder(e, 'tasks', 'Les tâches')) return;
+    var t = today();
+    var list = rowsOr('tasks').filter(function (r) { return !r.done && r.due && r.due < t; }).sort(sortTasks);
+    if (!list.length) { e.replaceChildren(msg('Rien en retard. Bravo.')); return; }
+    e.replaceChildren.apply(e, list.map(function (r) {
+      var row = taskRow(r, { compact: true });
+      row.append(btn("Reporter d'une semaine", '', function () { upd('tasks', r.id, { due: addDays(today(), 7) }); }), btn('×', 'pd-icon', function () { del('tasks', r.id); }, 'Supprimer : ' + (r.title || '')));
+      return row;
+    }));
+  });
+  dash.draw('rv-prio', function (e) {
+    if (placeholder(e, 'tasks', 'Les tâches')) return;
+    var lim = addDays(today(), 14);
+    var list = rowsOr('tasks').filter(function (r) { return !r.done && (r.prio || !r.due || r.due <= lim); }).sort(sortTasks);
+    e.replaceChildren.apply(e, list.length ? list.map(function (r) { return taskRow(r, { compact: true }); }) : [msg('Aucune tâche ouverte.')]);
+  });
+  dash.draw('rv-goals', function (e) {
+    if (placeholder(e, 'goals', 'Les objectifs')) return;
+    var act = activeGoals(rowsOr('goals'));
+    if (!act.length) { e.replaceChildren(msg("Aucun objectif en cours. C'est le bon moment pour en définir un.")); return; }
+    var tasks = rowsOr('tasks');
+    e.replaceChildren.apply(e, act.map(function (g) {
+      var row = goalLine(g);
+      if (!tasks.some(function (x) { return x.goalId === g.id && !x.done; })) row.append(pill('Aucune prochaine étape', 'pd-late'));
+      return row;
+    }));
+  });
+  dash.draw('rv-history', function (e) {
+    if (placeholder(e, 'reviews', 'Les revues')) return;
+    var list = rowsOr('reviews').slice().sort(function (a, b) { return String(b.date).localeCompare(String(a.date)); }).slice(0, 12);
+    if (!list.length) { e.replaceChildren(msg('Aucune revue enregistrée pour le moment.')); return; }
+    e.replaceChildren.apply(e, list.map(function (r) {
+      var row = el('div', 'pd-row'), main = el('span', 'pd-main');
+      main.append(el('span', '', 'Semaine du ' + fmtDate(r.date) + ' · ' + plural(Number(r.doneCount) || 0, 'tâche terminée', 'tâches terminées')));
+      [['Priorités : ', (r.prios || []).join(' · ')], ['Réussites : ', r.wins], ['Note : ', r.note]].forEach(function (x) { if (x[1]) main.append(el('span', 'pd-note', x[0] + x[1])); });
+      row.append(main);
+      return row;
+    }));
+  });
+
+  /* ---------- Coffre ---------- */
+  dash.draw('inv-sugg', function (e) {
+    var items = rows('items');
+    if (!items) { e.replaceChildren(msg('Chargement…')); return; }
+    var nodes = [];
+    Object.keys(ESSENTIALS).forEach(function (d) {
+      var missing = ESSENTIALS[d].filter(function (n) { return !hasItem(items, n); });
+      if (!missing.length) return;
+      var box = el('div', 'pd-sugg-dom'), lab = el('span'), chips = el('div', 'pd-chips');
+      lab.append(dotEl(d), document.createTextNode(d));
+      missing.forEach(function (n) {
+        chips.append(btn('+ ' + n, '', function () { $('i-name').value = n; $('i-domain').value = d; $('i-kind').value = 'Papier'; $('i-place').focus(); $('i-form').scrollIntoView({ behavior: 'smooth', block: 'center' }); }));
+      });
+      box.append(lab, chips);
+      nodes.push(box);
+    });
+    e.replaceChildren.apply(e, nodes.length ? nodes : [msg('Tous les essentiels de la liste sont notés. Ajoutez librement ce qui vous est propre.')]);
+  });
+  dash.draw('inv-list', function (e) {
+    if (placeholder(e, 'items', 'Les éléments')) return;
+    var items = rowsOr('items');
+    if (!items.length) { e.replaceChildren(msg("Coffre vide. Commencez par la liste des essentiels ci-dessus : un clic préremplit le formulaire, il ne reste qu'à dire où se trouve l'élément.")); return; }
+    var list = items.filter(function (r) { return kindFilter === 'all' || r.kind === kindFilter; });
+    if (!list.length) { e.replaceChildren(msg('Aucun élément de cette forme.')); return; }
+    var nodes = [];
+    DOMAINS.forEach(function (d) {
+      var g = list.filter(function (r) { return dom(r) === d; }).sort(function (a, b) { return String(a.name || '').localeCompare(String(b.name || ''), 'fr'); });
+      if (!g.length) return;
+      var h = el('div', 'pd-group'); h.append(dotEl(d), document.createTextNode(d + ' · ' + g.length));
+      nodes.push(h);
+      g.forEach(function (r) { nodes.push(itemRow(r)); });
+    });
+    e.replaceChildren.apply(e, nodes);
+  });
+  dash.draw('sitelist', function (e) {
+    if (placeholder(e, 'sites', 'Les comptes')) return;
+    var sites = rowsOr('sites');
+    if (!sites.length) { e.replaceChildren(msg('Aucun compte noté. Ajoutez chaque site au fur et à mesure du tri de votre boîte mail.')); return; }
+    var nodes = [];
+    DOMAINS.forEach(function (d) {
+      var g = sites.filter(function (r) { return dom(r) === d; }).sort(function (a, b) { return String(a.name || '').localeCompare(String(b.name || ''), 'fr'); });
+      if (!g.length) return;
+      var h = el('div', 'pd-group'); h.append(dotEl(d), document.createTextNode(d + ' · ' + g.length));
+      nodes.push(h);
+      g.forEach(function (r) { nodes.push(siteRow(r)); });
+    });
+    e.replaceChildren.apply(e, nodes);
+  });
+  dash.draw('reclist', function (e) {
+    if (placeholder(e, 'recurring', 'Les échéances')) return;
+    var list = rowsOr('recurring').slice().sort(sortRec);
+    e.replaceChildren.apply(e, list.length ? list.map(function (r) { return recRow(r); }) : [msg('Aucune échéance récurrente. Ajoutez la première, par exemple la date de renouvellement de votre passeport.')]);
+  });
+
+  /* ---------- Panneaux de modification ---------- */
+  var PANELS = ['edition', 'r-edition', 'i-edition', 's-edition', 'g-edition'];
+  function showPanel(id, focusId) {
+    PANELS.forEach(function (p) { $(p).hidden = p !== id; });
+    $(id).scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (focusId) $(focusId).focus({ preventScroll: true });
+  }
+  function closePanels() { PANELS.forEach(function (p) { $(p).hidden = true; }); editing = editingRec = editingItem = editingSite = editingGoal = null; showAlert('.pd-prio-msg', false); }
+  function safeDomain(v) { return DOMAINS.indexOf(v) !== -1 ? v : 'Général'; }
+
+  function openEdit(r) {
+    editing = r;
+    $('e-title').value = r.title || ''; $('e-domain').value = safeDomain(r.domain); $('e-due').value = r.due || ''; $('e-note').value = r.note || ''; $('e-prio').checked = !!r.prio;
+    showPanel('edition', 'e-title');
+    dash.draw('goal-opts');
+    var ids = rowsOr('goals').map(function (g) { return g.id; });
+    $('e-goal').value = r.goalId && ids.indexOf(r.goalId) !== -1 ? r.goalId : '';
+  }
+  function openRec(r) {
+    editingRec = r;
+    $('re-title').value = r.title || ''; $('re-domain').value = safeDomain(r.domain); $('re-next').value = r.next || ''; $('re-every').value = String(r.every || 1); $('re-unit').value = UNITS[r.unit] ? r.unit : 'month';
+    showPanel('r-edition', 're-next');
+  }
+  function openItem(r) {
+    editingItem = r;
+    $('ie-name').value = r.name || ''; $('ie-domain').value = safeDomain(r.domain); $('ie-kind').value = r.kind || 'Papier'; $('ie-exp').value = r.expiry || ''; $('ie-place').value = r.place || ''; $('ie-note').value = r.note || '';
+    showPanel('i-edition', 'ie-place');
+  }
+  function openSite(r) {
+    editingSite = r;
+    $('se-name').value = r.name || ''; $('se-url').value = r.url || ''; $('se-domain').value = safeDomain(r.domain); $('se-mail').value = r.email || ''; $('se-status').value = r.status || 'Actif'; $('se-cost').value = Number(r.cost) > 0 ? String(r.cost) : ''; $('se-note').value = r.note || '';
+    showPanel('s-edition', 'se-name');
+  }
+  function openGoal(g) {
+    editingGoal = g;
+    $('ge-title').value = g.title || ''; $('ge-domain').value = safeDomain(g.domain); $('ge-horizon').value = HOR_ORDER.indexOf(g.horizon) !== -1 ? g.horizon : 'Cette année'; $('ge-status').value = g.status || 'En cours'; $('ge-why').value = g.why || '';
+    showPanel('g-edition', 'ge-why');
+  }
+  ['e-cancel', 're-cancel', 'ie-cancel', 'se-cancel', 'ge-cancel'].forEach(function (id) { $(id).addEventListener('click', closePanels); });
+
+  $('edition').addEventListener('submit', async function (ev) {
+    ev.preventDefault(); if (!editing) return;
+    var r = editing, prio = $('e-prio').checked;
+    if (prio && !r.prio && !r.done && openPrioCount() >= MAX_PRIO) { showAlert('.pd-prio-msg', true); return; }
+    if (await upd('tasks', r.id, { title: $('e-title').value.trim() || r.title || '', domain: $('e-domain').value, due: $('e-due').value || '', note: $('e-note').value.trim(), prio: prio, goalId: $('e-goal').value || '' })) closePanels();
+  });
+  $('e-delete').addEventListener('click', async function () { if (editing && await del('tasks', editing.id)) closePanels(); });
+
+  $('r-edition').addEventListener('submit', async function (ev) {
+    ev.preventDefault(); if (!editingRec) return;
+    if (!$('re-next').value) { $('re-next').focus(); return; }
+    if (await upd('recurring', editingRec.id, { title: $('re-title').value.trim() || editingRec.title || '', domain: $('re-domain').value, next: $('re-next').value, every: Math.max(1, Number($('re-every').value) || 1), unit: $('re-unit').value })) closePanels();
+  });
+  $('re-delete').addEventListener('click', async function () { if (editingRec && await del('recurring', editingRec.id)) closePanels(); });
+
+  $('i-edition').addEventListener('submit', async function (ev) {
+    ev.preventDefault(); if (!editingItem) return;
+    if (await upd('inventory', editingItem.id, { name: $('ie-name').value.trim() || editingItem.name || '', domain: $('ie-domain').value, kind: $('ie-kind').value, expiry: $('ie-exp').value || '', place: $('ie-place').value.trim(), note: $('ie-note').value.trim() })) closePanels();
+  });
+  $('ie-delete').addEventListener('click', async function () { if (editingItem && await del('inventory', editingItem.id)) closePanels(); });
+
+  function cleanUrl(u) { u = String(u || '').trim(); return u && !/^https?:\/\//i.test(u) ? 'https://' + u : u; }
+  $('s-edition').addEventListener('submit', async function (ev) {
+    ev.preventDefault(); if (!editingSite) return;
+    var cost = Number($('se-cost').value);
+    if (await upd('sites', editingSite.id, { name: $('se-name').value.trim() || editingSite.name || '', url: cleanUrl($('se-url').value), domain: $('se-domain').value, email: $('se-mail').value.trim(), status: $('se-status').value, cost: cost > 0 ? Math.round(cost * 100) / 100 : 0, note: $('se-note').value.trim() })) closePanels();
+  });
+  $('se-delete').addEventListener('click', async function () { if (editingSite && await del('sites', editingSite.id)) closePanels(); });
+
+  $('g-edition').addEventListener('submit', async function (ev) {
+    ev.preventDefault(); if (!editingGoal) return;
+    if (await upd('goals', editingGoal.id, { title: $('ge-title').value.trim() || editingGoal.title || '', domain: $('ge-domain').value, horizon: $('ge-horizon').value, status: $('ge-status').value, why: $('ge-why').value.trim() })) closePanels();
+  });
+  $('ge-delete').addEventListener('click', async function () {
+    if (!editingGoal) return;
+    var g = editingGoal, linked = rowsOr('tasks').filter(function (x) { return x.goalId === g.id; });
+    var ok = await run(async function (db, base) {
+      for (var i = 0; i < linked.length; i++) await db.doc(base + '/tasks/items/' + linked[i].id).update({ goalId: '' });
+      await db.doc(base + '/goals/items/' + g.id).delete();
+    });
+    if (ok) closePanels();
+  });
+
+  /* ---------- Formulaires d'ajout ---------- */
+  $('t-form').addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    var title = $('t-title').value.trim(); if (!title) return;
+    var prio = $('t-prio').checked;
+    if (prio && openPrioCount() >= MAX_PRIO) { showAlert('.pd-prio-msg', true); return; }
+    showAlert('.pd-prio-msg', false);
+    if (await addTo('tasks', { title: title, domain: $('t-domain').value, due: $('t-due').value || '', done: false, prio: prio, created: new Date().toISOString() })) { $('t-title').value = ''; $('t-due').value = ''; $('t-prio').checked = false; }
+  });
+  $('t-showdone').addEventListener('change', function () { dash.draw('tasklist'); });
+
+  $('g-form').addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    var title = $('g-title').value.trim(); if (!title) return;
+    if (await addTo('goals', { title: title, domain: $('g-domain').value, horizon: $('g-horizon').value, status: 'En cours', why: '', created: new Date().toISOString() })) $('g-title').value = '';
+  });
+  $('g-showall').addEventListener('change', function () { dash.draw('goallist'); });
+
+  $('i-form').addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    var name = $('i-name').value.trim(); if (!name) return;
+    if (await addTo('inventory', { name: name, domain: $('i-domain').value, kind: $('i-kind').value, place: $('i-place').value.trim(), expiry: $('i-exp').value || '', note: '', created: new Date().toISOString() })) { $('i-name').value = ''; $('i-place').value = ''; $('i-exp').value = ''; }
+  });
+  $('i-kinds').addEventListener('click', function (ev) {
+    var b = ev.target.closest('button[data-k]'); if (!b) return;
+    kindFilter = b.getAttribute('data-k');
+    document.querySelectorAll('#i-kinds button').forEach(function (x) { x.classList.toggle('pd-on', x === b); });
+    dash.draw('inv-list');
+  });
+
+  $('s-form').addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    var name = $('s-name').value.trim(); if (!name) return;
+    var cost = Number($('s-cost').value);
+    if (await addTo('sites', { name: name, url: cleanUrl($('s-url').value), domain: $('s-domain').value, email: $('s-mail').value.trim(), status: $('s-status').value, cost: cost > 0 ? Math.round(cost * 100) / 100 : 0, note: '', created: new Date().toISOString() })) { $('s-name').value = ''; $('s-url').value = ''; $('s-mail').value = ''; $('s-cost').value = ''; $('s-status').value = 'Actif'; }
+  });
+
+  $('r-form').addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    var title = $('r-title').value.trim(); if (!title) return;
+    if (!$('r-next').value) { showAlert('.pd-rdate-msg', true); return; }
+    showAlert('.pd-rdate-msg', false);
+    if (await addTo('recurring', { title: title, domain: $('r-domain').value, next: $('r-next').value, every: Math.max(1, Number($('r-every').value) || 1), unit: $('r-unit').value, created: new Date().toISOString() })) { $('r-title').value = ''; $('r-next').value = ''; $('r-every').value = '1'; }
+  });
+
+  $('rv-save').addEventListener('click', async function () {
+    var t = today(), tasks = rowsOr('tasks'), since = addDays(t, -7);
+    var review = {
+      date: t,
+      doneCount: tasks.filter(function (r) { return r.done && r.doneAt && r.doneAt >= since; }).length,
+      prios: tasks.filter(function (r) { return !r.done && r.prio; }).map(function (r) { return String(r.title || ''); }),
+      wins: $('rv-wins').value.trim(), note: $('rv-note').value.trim(), created: new Date().toISOString()
+    };
+    var weekly = rowsOr('recurring').filter(function (r) { return norm(r.title).indexOf('revue de la semaine') !== -1; })[0];
+    var ok = await run(async function (db, base) {
+      await db.collection(base + '/reviews/items').add(review);
+      if (weekly) { var next = weekly.next || t; do { next = step(next, weekly.every, weekly.unit); } while (next <= t); await db.doc(base + '/recurring/items/' + weekly.id).update({ next: next, lastDone: t }); }
+    });
+    showAlert('.pd-review-ok', ok);
+    if (ok) { $('rv-wins').value = ''; $('rv-note').value = ''; $('obj-revue').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+  });
+
+  /* ---------- Navigation ---------- */
+  function redrawIn(root) {
+    if (!root) return;
+    var seen = {};
+    root.querySelectorAll('[data-draw]').forEach(function (x) { var n = x.getAttribute('data-draw'); if (!seen[n] && !x.closest('[hidden]')) { seen[n] = 1; dash.draw(n); } });
+  }
+  function goTab(id, noLink) {
+    if (TABS.indexOf(id) === -1) id = 'aujourdhui';
+    TABS.forEach(function (t) { var s = $(t); if (s) s.hidden = t !== id; });
+    document.querySelectorAll('#onglets button[data-tab]').forEach(function (b) { var on = b.getAttribute('data-tab') === id; b.classList.toggle('pd-on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false'); });
+    if (!noLink) dash.setLink(id);
+    redrawIn($(id));
+  }
+  function setSub(segId, subId) {
+    var seg = $(segId); if (!seg) return;
+    seg.querySelectorAll('button[data-sub]').forEach(function (b) { var s = b.getAttribute('data-sub'), on = s === subId; b.classList.toggle('pd-on', on); var p = $(s); if (p) p.hidden = !on; });
+    redrawIn($(subId));
+  }
+  $('onglets').addEventListener('click', function (ev) { var b = ev.target.closest('button[data-tab]'); if (b) goTab(b.getAttribute('data-tab')); });
+  ['obj-seg', 'coffre-seg'].forEach(function (id) { $(id).addEventListener('click', function (ev) { var b = ev.target.closest('button[data-sub]'); if (b) setSub(id, b.getAttribute('data-sub')); }); });
+  document.querySelectorAll('[data-goto]').forEach(function (b) { b.addEventListener('click', function () { if (b.getAttribute('data-goto') === 'ma-vie') setVieDomain('all'); goTab(b.getAttribute('data-goto')); }); });
+  $('go-revue').addEventListener('click', function () { goTab('objectifs'); setSub('obj-seg', 'obj-revue'); $('objectifs').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+
+  var start = (location.hash || '').replace('#', '');
+  if (TABS.indexOf(start) !== -1 && start !== 'aujourdhui') goTab(start, true);
+})();
+</script>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var pending = null;
+  var LABELS = { tasks: ['tâche', 'tâches'], recurring: ['échéance', 'échéances'], inventory: ['élément du coffre', 'éléments du coffre'], sites: ['compte', 'comptes'], goals: ['objectif', 'objectifs'], reviews: ['revue', 'revues'] };
+  function summary(counts) {
+    var parts = [];
+    Object.keys(LABELS).forEach(function (k) { var n = counts[k] || 0; if (n) parts.push(n + ' ' + LABELS[k][n > 1 ? 1 : 0]); });
+    return parts.length ? parts.join(', ') : 'aucune donnée';
+  }
+  function fmt(isoStr) { if (!isoStr) return ''; var d = new Date(isoStr); return d.toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' }) + ' à ' + d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }); }
+  function daysSince(isoStr) { return isoStr ? Math.floor((Date.now() - new Date(isoStr).getTime()) / 86400000) : Infinity; }
+  function fileName() { return 'centre-de-commande-' + new Date().toLocaleDateString('sv-SE') + '.json'; }
+  function say(id, text) { ['b-error', 'b-ok'].forEach(function (x) { $(x).hidden = true; }); if (id) { $(id).textContent = text; $(id).hidden = false; } }
+
+  function refresh() {
+    var last = cdcBackup.lastExport(), total = cdcBackup.total();
+    $('b-state').textContent = 'Sur cet appareil : ' + summary(cdcBackup.counts()) + '. ' + (last ? 'Dernière sauvegarde : le ' + fmt(last) + '.' : 'Aucune sauvegarde téléchargée pour le moment.');
+    var d = daysSince(last);
+    var remind = total > 0 && d >= 7;
+    $('rappel-sauvegarde').hidden = !remind || !$('sauvegarde').hidden;
+    $('rappel-texte').textContent = last ? 'Dernière sauvegarde il y a ' + d + ' jours. Pensez à en refaire une.' : "Vous n'avez encore jamais sauvegardé vos données.";
+    $('b-storage').hidden = cdcBackup.storageOk();
+  }
+  window.__cdcBackupRefresh = refresh;
+
+  function openPanel() { $('sauvegarde').hidden = false; $('rappel-sauvegarde').hidden = true; refresh(); $('sauvegarde').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+  $('b-open').addEventListener('click', openPanel);
+  $('rappel-btn').addEventListener('click', openPanel);
+  $('b-close').addEventListener('click', function () { $('sauvegarde').hidden = true; pending = null; $('b-import').hidden = true; say(null); refresh(); });
+
+  function blob() { return new Blob([cdcBackup.exportJson()], { type: 'application/json' }); }
+  $('b-export').addEventListener('click', function () {
+    try {
+      var url = URL.createObjectURL(blob());
+      var a = document.createElement('a');
+      a.href = url; a.download = fileName();
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      cdcBackup.markExported();
+      say('b-ok', 'Sauvegarde téléchargée : ' + fileName() + '. Rangez-la dans un endroit sûr, par exemple OneDrive.');
+      refresh();
+    } catch (err) { say('b-error', "Le téléchargement n'a pas fonctionné. Essayez le bouton d'envoi, ou un autre navigateur."); }
+  });
+
+  try {
+    var test = new File(['{}'], 'test.json', { type: 'application/json' });
+    if (navigator.canShare && navigator.canShare({ files: [test] })) $('b-share').hidden = false;
+  } catch (err) {}
+  $('b-share').addEventListener('click', async function () {
+    try {
+      var f = new File([blob()], fileName(), { type: 'application/json' });
+      await navigator.share({ files: [f], title: 'Sauvegarde du Centre de commande' });
+      cdcBackup.markExported();
+      say('b-ok', 'Sauvegarde envoyée.');
+      refresh();
+    } catch (err) { if (err && err.name === 'AbortError') return; say('b-error', "L'envoi n'a pas fonctionné. Utilisez plutôt « Télécharger une sauvegarde »."); }
+  });
+
+  $('b-file').addEventListener('change', function () {
+    var file = $('b-file').files && $('b-file').files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        pending = cdcBackup.parse(String(reader.result));
+        var counts = {}; Object.keys(pending.store).forEach(function (k) { counts[k] = pending.store[k].length; });
+        $('b-import-title').textContent = 'Fichier « ' + file.name + ' »';
+        $('b-import-detail').textContent = 'Contient : ' + summary(counts) + '.' + (pending.exportedAt ? ' Sauvegarde du ' + fmt(pending.exportedAt) + '.' : '');
+        $('b-import').hidden = false;
+        say(null);
+      } catch (err) { pending = null; $('b-import').hidden = true; say('b-error', err && err.message ? err.message : 'Fichier illisible.'); }
+      $('b-file').value = '';
+    };
+    reader.onerror = function () { say('b-error', 'Impossible de lire ce fichier.'); };
+    reader.readAsText(file);
+  });
+  function done(text) { pending = null; $('b-import').hidden = true; say('b-ok', text); refresh(); }
+  $('b-replace').addEventListener('click', function () { if (!pending) return; try { cdcBackup.replace(pending.store); done('Données remplacées par la sauvegarde.'); } catch (err) { say('b-error', "L'enregistrement a échoué : stockage plein ou bloqué."); } });
+  $('b-merge').addEventListener('click', function () { if (!pending) return; try { cdcBackup.merge(pending.store); done('Les éléments manquants ont été ajoutés.'); } catch (err) { say('b-error', "L'enregistrement a échoué : stockage plein ou bloqué."); } });
+  $('b-cancel').addEventListener('click', function () { pending = null; $('b-import').hidden = true; });
+
+  refresh();
+  setInterval(refresh, 60000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) { refresh(); if (window.__cdcRedraw) window.__cdcRedraw(); } });
+
+  // Fonctionnement hors connexion (seulement quand la page est servie en https)
+  if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+    window.addEventListener('load', function () { navigator.serviceWorker.register('./sw.js').catch(function () {}); });
+  }
+})();
+</script>
+</body>
+</html>
